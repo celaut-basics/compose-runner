@@ -1,0 +1,52 @@
+{
+    "tag": "compose-runner",
+    "architecture": "linux/arm64",
+    "init": {
+        "entry_path": ["service", "entrypoint.sh"]
+    },
+    "api": [
+        {
+            "port": 8080,
+            "transport": "tcp",
+            "protocol": [
+                "http"
+            ]
+        },
+        {
+            "port": 9000,
+            "transport": "tcp",
+            "protocol": [
+                "http"
+            ]
+        }
+    ],
+    "envs": [
+        "COMPOSE_PROJECT_NAME",
+        "COMPOSE_FILE",
+        "COMPOSE_UP_TIMEOUT_S",
+        "COMPOSE_DOWN_TIMEOUT_S",
+        "DOCKERD_TIMEOUT_S",
+        "DOCKERD_STORAGE_DRIVER",
+        "DOCKERD_DATA_ROOT",
+        "HEALTH_PORT",
+        "IPTABLES_BACKEND"
+    ],
+    "network": [
+        {
+            "tags": [
+                "*"
+            ],
+            "prose": "Open egress, because this service pulls container images and the hosts it pulls them from cannot be enumerated in advance. A registry answers the manifest request itself and then redirects the layer blobs to a CDN: Docker Hub serves them from production.cloudflare.docker.com, ghcr.io from pkg-containers.githubusercontent.com, and which edge address answers is chosen per request. The operator's compose file decides which registries are involved, and that file is not written until after this service is packed -- so there is no list a declaration here could name even for one stack, let alone for the template this service is. Two nodo facts make a narrower declaration not merely imprecise but non-functional, both verified against the checkout rather than assumed. A hostname tag is resolved by the NODE (src/manager/networks.py resolve_domain) into A records and the firewall opens exactly those addresses on TCP 80 and 443; it opens nothing on UDP 53, and src/virtualizers/microvm/network.py states outright that no port-53 rule is written and that nodo does not serve DNS. dockerd resolves registry names for itself and cannot be handed addresses, so it would be granted hosts it can never look up (celaut-project/nodo#389). And resolve_network applies only the FIRST tag of an entry that resolves before breaking, so a multi-hostname entry grants one hostname's addresses and silently drops the rest (#390); a wildcard such as *.docker.io raises ValueError out of the resolver and aborts the launch rather than degrading (#391). This is the same position celaut-basics/bitcoin-node and celaut-basics/yt-transcript are in, declared plainly rather than dressed up as a narrower ask this service would then quietly fail to honour. What this egress is used for is bounded by the stack the operator packed, and not by this service: nothing in this image opens a socket of its own except dockerd fetching what the compose file names, and an operator who wants no egress at all can pack the images as tars into stack/images/ -- service/supervisor.py loads them before compose runs, which makes the image bytes part of the content-addressed service and removes the need for a registry entirely. An operator who wants the boundary enforced at the node rather than taken on trust has service_networks in config.yaml; NODE-REQUIREMENTS.md says what happens under each policy."
+        }
+    ],
+    "resources": {
+        "at_init": {
+            "mem_limit": 1000000000,
+            "disk_space": 4000000000
+        },
+        "at_most": {
+            "mem_limit": 4000000000,
+            "disk_space": 12000000000
+        }
+    }
+}
