@@ -27,12 +27,18 @@ ARG BASE_DIGEST=sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b0
 FROM debian:bookworm-slim@${BASE_DIGEST} AS fetch
 
 # Not pinned to exact versions, unlike the runtime's packages below, and the asymmetry
-# is the reason: nothing installed here reaches the exported filesystem. A `tar` that
-# changes cannot change what this service *is* unless it changes what it extracts, and
-# what it extracts is verified by SHA-256 before extraction and smoke-tested after.
+# is the reason: nothing installed here reaches the exported filesystem. A `curl` that
+# changes cannot change what this service *is* unless it changes what it downloads, and
+# what it downloads is verified by SHA-256 before extraction and smoke-tested after.
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates \
+    && apt-get install --no-install-recommends -y ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+# One Dockerfile for both architectures. BuildKit sets TARGETARCH from the platform
+# that nodo's packer passes (`--opt platform=<architecture in service.json>`), so a
+# change of `architecture` in .service/service.json is the only edit needed. The
+# packer builds only for the architecture of its own host (docs/PACKING.md).
+ARG TARGETARCH
 
 # --------------------------------------------------------------------- docker engine
 # The **static** binary bundle from download.docker.com, not the `docker-ce` apt
@@ -48,14 +54,10 @@ RUN apt-get update \
 # moves -- the same trade `ergo-node` makes for the Ergo jar and `bitcoin-node` for the
 # Core tarball.
 #
-# 29.8.1 is the newest stable at the time of writing. `aarch64` is Docker's spelling of
-# what Debian calls arm64; building this for amd64 is `architecture` in service.json
-# plus the `x86_64` path and its checksum here.
+# The checksums were computed from the published artifacts:
 #
-# The checksum was computed from the published artifact:
-#
-#   curl -fsSLO https://download.docker.com/linux/static/stable/aarch64/docker-29.8.1.tgz
-#   sha256sum docker-29.8.1.tgz
+#   curl -fsSL https://download.docker.com/linux/static/stable/aarch64/docker-29.8.1.tgz | sha256sum
+#   curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-29.8.1.tgz | sha256sum
 #
 # **download.docker.com publishes no checksum file next to the static tarballs** --
 # verified, `docker-29.8.1.tgz.sha256` is a 404 -- so unlike the compose plugin below
@@ -64,32 +66,44 @@ RUN apt-get update \
 # a signed sums file and is stated rather than glossed over; the same caveat `ergo-node`
 # records for the Ergo jar.
 ARG DOCKER_VERSION=29.8.1
-ARG DOCKER_SHA256=667395fbffab52901b80181dfbb39ea76da2fbd7642c4fbddd24e42146b07b48
-ADD https://download.docker.com/linux/static/stable/aarch64/docker-${DOCKER_VERSION}.tgz /tmp/docker.tgz
-RUN echo "${DOCKER_SHA256}  /tmp/docker.tgz" | sha256sum -c - \
-    && mkdir -p /tmp/docker-unpacked \
-    && tar -xzf /tmp/docker.tgz -C /tmp/docker-unpacked --strip-components=1 \
-    && ls -1 /tmp/docker-unpacked
+ARG DOCKER_SHA256_ARM64=667395fbffab52901b80181dfbb39ea76da2fbd7642c4fbddd24e42146b07b48
+ARG DOCKER_SHA256_AMD64=d8db66739d2e28d4933786d73e918d9be643a67fbd835db1bf740d650a259e70
 
 # -------------------------------------------------------------------- compose plugin
 # The compose v2 plugin binary, pinned by the SHA-256 from the `checksums.txt` that the
 # docker/compose release publishes -- an **upstream document**, which is what the engine
-# tarball above does not have. Confirmed by downloading the artifact and comparing:
+# tarball above does not have:
 #
 #   curl -fsSL https://github.com/docker/compose/releases/download/v5.5.1/checksums.txt \
-#     | grep linux-aarch64
+#     | grep 'linux-\(aarch64\|x86_64\)$'
 #
 # Installed as a CLI plugin at `cli-plugins/docker-compose` rather than as a standalone
 # `docker-compose`, because `docker compose` (the subcommand) is what this service
 # invokes and what current compose documentation describes. The standalone spelling is
 # the v1 shape and is not what the plugin protocol expects.
 ARG COMPOSE_VERSION=5.5.1
-ARG COMPOSE_SHA256=732e3a84c1a0f67256ce80bc2598a24546b10ca05f9faa97efceb1171ece2ef7
-ADD https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-aarch64 /tmp/docker-compose
-# `ADD` from a URL writes mode 0600 owned by root. It is chmod'ed here rather than only
-# in the runtime stage so the verification and the mode live next to each other.
-RUN echo "${COMPOSE_SHA256}  /tmp/docker-compose" | sha256sum -c - \
-    && chmod 0755 /tmp/docker-compose
+ARG COMPOSE_SHA256_ARM64=732e3a84c1a0f67256ce80bc2598a24546b10ca05f9faa97efceb1171ece2ef7
+ARG COMPOSE_SHA256_AMD64=db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576
+
+# Docker and compose spell the architectures `aarch64` and `x86_64`; BuildKit spells
+# them `arm64` and `amd64`. An architecture with no pinned checksum stops the build.
+# Each download is verified before anything reads it.
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+        arm64) arch=aarch64; docker_sha="${DOCKER_SHA256_ARM64}"; compose_sha="${COMPOSE_SHA256_ARM64}" ;; \
+        amd64) arch=x86_64;  docker_sha="${DOCKER_SHA256_AMD64}"; compose_sha="${COMPOSE_SHA256_AMD64}" ;; \
+        *) echo "no pinned Docker build for TARGETARCH='${TARGETARCH}'" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/docker.tgz \
+        "https://download.docker.com/linux/static/stable/${arch}/docker-${DOCKER_VERSION}.tgz"; \
+    echo "${docker_sha}  /tmp/docker.tgz" | sha256sum -c -; \
+    mkdir -p /tmp/docker-unpacked; \
+    tar -xzf /tmp/docker.tgz -C /tmp/docker-unpacked --strip-components=1; \
+    ls -1 /tmp/docker-unpacked; \
+    curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/docker-compose \
+        "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-${arch}"; \
+    echo "${compose_sha}  /tmp/docker-compose" | sha256sum -c -; \
+    chmod 0755 /tmp/docker-compose
 
 # -------------------------------------------------------------------------- runtime
 FROM debian:bookworm-slim@${BASE_DIGEST} AS runtime
@@ -175,10 +189,9 @@ RUN apt-get update \
 #                              it is the one whose absence would break the published
 #                              slots specifically, silently, and only for connections
 #                              from outside the VM.
-#   docker-init                the `--init` tini shim. Not used by this service's own
-#                              compose invocation, but a packed stack is free to set
-#                              `init: true` on a service, and its absence would fail
-#                              that container at start rather than at pack time.
+#   docker-init                tini. service/entrypoint.sh runs it as PID 1, to reap
+#                              orphans and forward signals to the supervisor. A
+#                              packed stack can also set `init: true` on a service.
 #
 # `ctr` is deliberately not copied: it is containerd's own debug CLI, it talks to the
 # same socket with the same authority, and nothing here invokes it.
@@ -215,13 +228,13 @@ COPY --from=fetch /tmp/docker-unpacked/docker-init             /opt/docker/bin/d
 COPY --from=fetch /tmp/docker-compose                          /usr/local/lib/docker/cli-plugins/docker-compose
 
 # dockerd finds `containerd`, `runc`, `docker-proxy` and the shim by searching PATH, not
-# by an absolute path it was compiled with. So this line is not cosmetic: without
-# /opt/docker/bin on PATH, dockerd starts and then fails to launch any container with
-# "exec: \"docker-proxy\": executable file not found", which reads like a container
-# problem rather than a PATH one.
+# by an absolute path it was compiled with.
 #
-# `/usr/local/sbin` first, because that is where service/entrypoint.sh puts the
-# iptables symlinks that select the legacy backend, and it must win over /usr/sbin.
+# **nodo ignores this line.** The packer exports the image as a filesystem, and every
+# `ENV` is lost (docs/PACKING.md). The guest /init starts the entrypoint with its own
+# PATH, which does not contain /opt/docker/bin. So service/entrypoint.sh sets PATH, and
+# the supervisor sets it again for each child. This line only serves `docker run` and
+# `docker exec` in local tests.
 ENV PATH="/usr/local/sbin:/opt/docker/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # The operator's stack. Copied as a directory so `stack/.env`, `stack/images/*.tar` and
@@ -238,9 +251,11 @@ COPY ./service /service
 # bytes; a copy of the port list in an env var would be a second declaration to keep in
 # sync, and the failure of that sync is exactly what the check exists to catch.
 #
-# It is a `.service/` path, which nodo's packer rewrites when it moves the Dockerfile
-# (`docs/PACKING.md`, "COPY Path Adjustment"), so this is written the way the packer
-# expects to find it.
+# The packer rewrites every `COPY ./x` to `COPY service/x` (docs/PACKING.md, "COPY Path
+# Adjustment"), and `service/` holds only what `include` in pack_config.json lists. So
+# `.service/service.json` and `.service/preflight.py` are in `include`. Without them
+# this COPY has no source and `nodo pack` fails. tests/test_packing.py checks every
+# COPY source against that rule.
 COPY ./.service/service.json /.service/service.json
 
 RUN chmod 0755 /service/entrypoint.sh \
@@ -267,7 +282,7 @@ RUN set -eu; \
     /opt/docker/bin/runc --version; \
     /opt/docker/bin/docker-proxy --help 2>/dev/null || true; \
     test -x /opt/docker/bin/containerd-shim-runc-v2; \
-    test -x /opt/docker/bin/docker-init; \
+    /opt/docker/bin/docker-init --version; \
     /usr/local/lib/docker/cli-plugins/docker-compose version; \
     /opt/docker/bin/docker compose version; \
     /usr/bin/python3 --version; \
@@ -298,9 +313,7 @@ COPY ./.service/preflight.py /tmp/preflight.py
 RUN /usr/bin/python3 /tmp/preflight.py /app/stack/docker-compose.yml /.service/service.json \
     && rm -f /tmp/preflight.py
 
-# No ENTRYPOINT and no CMD, deliberately. `docs/PACKING.md` is explicit that a service's
-# Dockerfile must define neither, because nodo's packer exports the built image as a
-# *filesystem* and the thing that gets exec'd comes from `init.entry_path` in
-# service.json. A harness that runs `docker run <image>` with no command therefore needs
-# `--entrypoint /service/entrypoint.sh`, which is what tests/test_image.sh passes and
-# what the README documents.
+# No ENTRYPOINT and no CMD. nodo's packer exports the built image as a *filesystem*
+# and ignores both (docs/PACKING.md); what is exec'd comes from `init.entry_path` in
+# service.json. A harness that runs `docker run <image>` therefore passes
+# `--entrypoint /service/entrypoint.sh`, as tests/test_image.sh and the README do.

@@ -5,10 +5,11 @@
   "zip": false,
   "include": [
     "service",
-    "stack"
+    "stack",
+    ".service/service.json",
+    ".service/preflight.py"
   ],
   "ignore": [
-    "tests/",
     "*.pyc",
     "__pycache__/"
   ]

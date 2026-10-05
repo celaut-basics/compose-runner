@@ -1,5 +1,3 @@
-tests/
-*.md
-.git/
+.git
 __pycache__/
 *.pyc
