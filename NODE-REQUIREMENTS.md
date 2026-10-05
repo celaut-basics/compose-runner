@@ -1,4 +1,4 @@
-# What this service needs from the node, and five things the spec cannot express
+# What this service needs from the node, and seven things the spec cannot express
 
 `compose-runner` asks for more than any other service in `celaut-basics`, because it
 runs a container runtime inside the sandbox rather than a program. This is the list of
@@ -6,7 +6,8 @@ what it needs, and then the findings that are really about nodo rather than abou
 service — written down because they were found by building against
 [`celaut-project/nodo`](https://github.com/celaut-project/nodo) at `upstream/dev`
 (`306e3531`), and because the first one would silently produce a stack with no egress at
-all.
+all. Findings 6 and 7, and the corrections marked "Re-checked", come from a review
+against nodo `dev` at `b2f79449`.
 
 Everything below about the guest kernel was resolved by running Kconfig itself, not by
 reading the fragment: `make ARCH=arm64 defconfig && make ARCH=arm64 kvm_guest.config`
@@ -19,11 +20,11 @@ drops any symbol whose dependencies are unmet, which is exactly what finding 1 i
 
 | | |
 |---|---|
-| **egress** | `["*"]`. Image pulls; why it cannot be narrower is in the README and in finding 3 below. An operator who packs `stack/images/*.tar` needs none of it. |
+| **egress** | `["*"]`. Image pulls, and the public DNS resolver that dockerd needs to find a registry (finding 7). Why it cannot be narrower is in the README and in finding 3 below. An operator who packs `stack/images/*.tar` needs none of it. |
 | **API slots** | One per port the packed compose file publishes, plus TCP 9000 for the health slot. The compose file's `ports:` bind on the microVM's own interface, which *is* the service's address, so a slot maps to a published port directly with no proxy. `service/compose_spec.py` refuses to start if the two lists disagree. |
 | **CPU** | Whatever the operator grants, and it is shared by every container in the stack. |
 | **memory** | 1 GB at init, 4 GB at most. dockerd + containerd idle at ~120 MB before the stack's own containers. |
-| **disk** | 4 GB at init, 12 GB at most. **The stack's images live on this disk** — see below. |
+| **disk** | 4 GB, fixed at boot from `at_init.disk_space`. **The stack's images live on this disk** — see below. |
 | **a writable rootfs** | Non-negotiable, and the reason this service must **not** declare `read_only_filesystem: true`. See finding 2. |
 | **cgroups** | The unified hierarchy at `/sys/fs/cgroup`. nodo's initramfs already mounts it. See finding 5. |
 
@@ -60,9 +61,14 @@ The remaining ~3.6 GB of the declared 4 GB is for **the operator's stack**: ever
 it pulls is written into `/var/lib/docker` on this instance's disk, and a single
 application image is routinely 200 MB–1.5 GB. A three-service stack on `vfs` (finding 2)
 can be several times that again, because vfs copies every layer whole instead of sharing
-it. 12 GB `at_most` is what a stack of ordinary size needs; a stack of large images needs
-the figure raised, and that is a one-line edit in `.service/service.json` the README
-points at.
+it.
+
+Re-checked: **`at_most.disk_space` does not grow the disk.** `requested_disk_space_bytes`
+(`src/virtualizers/microvm/limits.py`) reads `at_init.disk_space` first, and the ext4
+image is built once at that size. An earlier version declared 12 GB `at_most`, which
+gave the stack no extra byte and only raised the admission figure. Both are now 4 GB. A
+stack of large images needs `at_init.disk_space` raised, a one-line edit in
+`.service/service.json`.
 
 ---
 
@@ -237,9 +243,9 @@ and it is why `network` here is `["*"]`.
 Declaring `tags: ["registry-1.docker.io"]` looks like the right, narrow thing. What the
 node does with it:
 
-- `resolve_network` → `resolve_domain` (`src/manager/networks.py:47-69`) resolves the tag
-  **on the node**, to IPv4 A records, and builds `Instance.Uri` entries for ports **80
-  and 443** only, hardcoded, with a `TODO` saying it should come from the protocol stack;
+- `resolve_network` → `resolve_domain` (`src/manager/networks.py`) resolves the tag
+  **on the node**, to IPv4 A records, and builds `Instance.Uri` entries for ports 80 and
+  443, or for the one port that the entry's `formal` states as `port=<n>` (#389);
 - the firewall writes one allow per address, on the forward hook.
 
 And from `src/virtualizers/microvm/network.py:513`:
@@ -336,6 +342,62 @@ requirement. Recorded because the distance between the warning and the panic is 
 makes it hard to diagnose.
 
 ---
+
+## 6. nodo applies no `ENV` of the image, so `PATH` is the entrypoint's job
+
+Re-checked against `b2f79449`. The packer exports the built image as a filesystem
+(`buildctl build --output type=tar`, `docs/PACKING.md`). Image metadata, `ENV` included,
+is not kept. The guest `/init` (`bash/build_ch_initramfs.sh`) exports its own
+`PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` and then does
+`exec switch_root /newroot "$ENTRYPOINT"`.
+
+**Why that breaks a container runtime specifically.** The Docker static bundle is in
+`/opt/docker/bin`, and dockerd finds `containerd`, `runc`, `docker-proxy` and the shim
+through `PATH`. The Dockerfile's `ENV PATH=…/opt/docker/bin…` made every
+`docker run` test pass, and has no effect under nodo. dockerd would start and fail to
+start containerd.
+
+**What this service does about it:** `service/entrypoint.sh` exports `PATH`
+(`config.RUNTIME_PATH`), and the supervisor sets it again for each child.
+`tests/test_image.sh` starts the container with the `/init` PATH, so a local run
+tests the same environment as a node.
+
+**What nodo could do about it:** `docs/PACKING.md` already says not to use `ENV` for
+runtime configuration. A line that says `ENV PATH` is lost too would help, because
+`PATH` is the one variable a Dockerfile usually sets for its own binaries.
+
+## 7. A guest has no resolver, and `["*"]` does not give one
+
+Re-checked against `b2f79449`. `src/virtualizers/microvm/network.py` states that nodo
+writes no `/etc/hosts` and no `/etc/resolv.conf` into the guest, serves no DNS, and
+opens no port 53 toward the node. The exported image has no `resolv.conf` that names a
+server (Docker writes one only at `docker run`). The `*` tag opens egress to every
+address, but nothing tells a program in the guest which address to ask for a name.
+
+So dockerd, which resolves registry names itself, fails each pull with a lookup error.
+The containers of the stack, which get their resolver from dockerd, cannot resolve
+names either.
+
+**What this service does about it:** before dockerd starts, the supervisor writes
+`/etc/resolv.conf` with `DNS_SERVERS` (default `1.1.1.1 8.8.8.8`) when the file names no
+server. The `*` grant makes those addresses reachable. A file that already names a
+server (the `docker run` case) is kept, unless `DNS_SERVERS` is set.
+
+**The gap:** the spec has no way to ask the node for a resolver, and no way to say
+which resolver a `*` service uses. A service that declares `*` and takes host names
+must bring its own, as this one does.
+
+## Also re-checked: how an instance stops
+
+`nodo kill` sends SIGKILL to the hypervisor process (`src/virtualizers/microvm/kill.py`)
+and removes the runtime directory with the guest disk. The guest gets no signal, so the
+supervisor's SIGTERM handler, and `docker compose down`, do not run on a node. That is
+not a defect here: nothing on the guest disk survives the instance. The handler is for
+`docker stop` and other runtimes.
+
+If the supervisor exits, PID 1 (tini) exits and the guest kernel panics. nodo reads the
+panic line from the serial log (`src/virtualizers/microvm/guest_panic.py`) and removes
+the instance. So a fatal error in the supervisor is an exit with a logged reason.
 
 ## What was verified, and where
 
