@@ -406,17 +406,29 @@ The first version was run on Apple Silicon (`linux/arm64`, Docker Engine 29.5.2)
 - A slot that was not published was refused with exit **1**, before a container was
   created.
 
+The audit against nodo `dev` (`698e6583`) built the image again (`linux/arm64`, Colima,
+Docker 29 in the VM) and ran it:
+
+- `tests/test_image.sh`: **40 passed, 0 failed**, with the `PATH` of the nodo `/init`.
+  This includes tini as PID 1, the legacy backend, the cross-check, the published port
+  from outside, the 503 after stop, and SIGTERM to `compose down`.
+- With `/var/lib/docker` on a volume (ext4, as the rootfs of a nodo guest) and an
+  empty `/etc/resolv.conf`: the supervisor wrote `1.1.1.1` and `8.8.8.8`, dockerd
+  started with **overlay2** (no fallback), the images were pulled through those
+  resolvers, and the stack was up in 2.6 s. Without the volume, overlay2 failed on the
+  overlay of the outer container and vfs was used, as before.
+- The SHA-256 of the four pinned downloads (Docker 29.8.1 and compose v5.5.1, `aarch64`
+  and `x86_64`) were compared with the published artifacts. All four agree.
+
 **Not verified:**
 
 - **This has never run under a real nodo.** It has not been through `nodo pack`, the
   firewall, or a microVM. The guest-kernel findings in
   [`NODE-REQUIREMENTS.md`](NODE-REQUIREMENTS.md) come from Kconfig, not from a booted
-  guest.
-- The changes of the review against nodo `dev` (`include`, `PATH`, the resolver
-  file, tini, the health phases, the amd64 build) pass the offline tests. No image was
-  built for them, and `test_image.sh` was not run again.
-- amd64, the `stack/images/*.tar` path with a real tar, stacks with `build:`
-  contexts, and long runs.
+  guest. The `raw` table switch and the `bpf(2)` warning of finding 8 could not be
+  tested, because the kernel of the test host has both.
+- amd64 (no image was built), the `stack/images/*.tar` path with a real tar, stacks
+  with `build:` contexts, and long runs.
 
 ## What is deliberately not here
 
