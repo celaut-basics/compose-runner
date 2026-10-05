@@ -25,6 +25,16 @@ DOCKERD_BIN = "/opt/docker/bin/dockerd"
 # comment on the COPY in .service/Dockerfile.
 COMPOSE_PLUGIN = "/usr/local/lib/docker/cli-plugins/docker-compose"
 DOCKER_INIT_BIN = "/opt/docker/bin/docker-init"
+# The `iptables` that dockerd uses. service/entrypoint.sh links it to the backend it
+# selects.
+IPTABLES_BIN = "/usr/local/sbin/iptables"
+# The variable that tells dockerd (28.0 and later) not to write rules in the iptables
+# `raw` table. See Supervisor.dockerd_env.
+NO_IPTABLES_RAW_ENV = "DOCKER_INSECURE_NO_IPTABLES_RAW"
+# This sysctl exists only when the kernel has CONFIG_BPF_SYSCALL. See
+# Supervisor.check_guest_kernel.
+BPF_SYSCTL = "/proc/sys/kernel/unprivileged_bpf_disabled"
+CGROUP_ROOT = "/sys/fs/cgroup"
 SERVICE_JSON = "/.service/service.json"
 STACK_DIR = "/app/stack"
 DEFAULT_COMPOSE_FILE = STACK_DIR + "/docker-compose.yml"

@@ -37,11 +37,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import compose_spec
 import health
 from config import (
+    BPF_SYSCTL,
+    CGROUP_ROOT,
     COMPOSE_PLUGIN,
     Config,
     ConfigError,
     DOCKER_BIN,
     DOCKERD_BIN,
+    IPTABLES_BIN,
+    NO_IPTABLES_RAW_ENV,
     RESOLV_CONF,
     RUNTIME_PATH,
     SERVICE_JSON,
@@ -210,6 +214,80 @@ class Supervisor:
         log(f"DNS servers in {path}: {', '.join(self.config.dns_servers)}")
         return True
 
+    # ------------------------------------------------------------------ guest kernel
+    def iptables_raw_available(self) -> bool:
+        """True if the selected `iptables` can read the `raw` table."""
+        code, _, _ = _run(
+            [IPTABLES_BIN, "-t", "raw", "-S"],
+            timeout_s=10,
+            env=self.compose_env(),
+        )
+        return code == 0
+
+    def dockerd_env(self) -> Dict[str, str]:
+        """The environment of dockerd: the compose environment, plus one variable.
+
+        dockerd 28.0 and later writes a DROP rule in the iptables `raw` table for each
+        container endpoint on a bridge network (moby
+        daemon/libnetwork/drivers/bridge/internal/iptabler/endpoint.go,
+        `filterDirectAccess`). The nodo guest kernel has no `CONFIG_IP_NF_RAW`, so
+        that rule fails, and each container of the stack fails to start.
+
+        When the `raw` table cannot be read, this sets
+        DOCKER_INSECURE_NO_IPTABLES_RAW=1, which is moby's own switch for a kernel
+        with no `raw` table. dockerd then writes no `raw` rule. The cost: a host on
+        the same link as the guest can send packets to a container address directly.
+        In a nodo guest that link is the node's bridge, and the node firewall blocks
+        traffic between instances. NODE-REQUIREMENTS.md, finding 8.
+
+        A value that the operator set is kept.
+        """
+        env = self.compose_env()
+        if env.get(NO_IPTABLES_RAW_ENV):
+            log(f"{NO_IPTABLES_RAW_ENV}={env[NO_IPTABLES_RAW_ENV]} was set at launch; kept")
+            return env
+        if not self.iptables_raw_available():
+            env[NO_IPTABLES_RAW_ENV] = "1"
+            log(
+                "WARNING: the iptables raw table is not available (the kernel has no "
+                f"CONFIG_IP_NF_RAW). dockerd starts with {NO_IPTABLES_RAW_ENV}=1, so "
+                "it does not block direct access to container addresses. See "
+                "NODE-REQUIREMENTS.md, finding 8."
+            )
+        return env
+
+    def check_guest_kernel(
+        self, bpf_sysctl: str = BPF_SYSCTL, cgroup_root: str = CGROUP_ROOT
+    ) -> List[str]:
+        """Log the kernel gaps that stop containers before dockerd hides them.
+
+        On cgroup v2, runc applies the device rules of a container with an eBPF
+        program. With no bpf(2) in the kernel (no CONFIG_BPF_SYSCALL), runc refuses
+        each container that has a deny rule, which is each container that is not
+        `privileged: true` (opencontainers/cgroups devices/v2.go, `setV2` and
+        `canSkipEBPFError`). The nodo x86_64 guest kernel has no CONFIG_BPF_SYSCALL.
+        The arm64 guest kernel has it. NODE-REQUIREMENTS.md, finding 8.
+
+        Not fatal: a stack of privileged containers still starts, and the check
+        reads a proxy for the kernel option, not the option itself. The warning is
+        there so the runc error that follows has a cause next to it.
+
+        Returns the warnings, for the tests.
+        """
+        warnings: List[str] = []
+        cgroup_v2 = os.path.exists(os.path.join(cgroup_root, "cgroup.controllers"))
+        if cgroup_v2 and not os.path.exists(bpf_sysctl):
+            warnings.append(
+                "WARNING: cgroup v2 is mounted and the kernel has no bpf(2) "
+                f"({bpf_sysctl} is missing, so CONFIG_BPF_SYSCALL is off). runc "
+                "cannot apply device rules, so each container that is not "
+                "privileged will fail to start. This is a gap of the guest kernel. "
+                "See NODE-REQUIREMENTS.md, finding 8."
+            )
+        for warning in warnings:
+            log(warning)
+        return warnings
+
     # ---------------------------------------------------------------------- dockerd
     def dockerd_argv(self, storage_driver: str) -> List[str]:
         """The dockerd command line, and why each flag is on it.
@@ -286,6 +364,7 @@ class Supervisor:
         else:
             drivers = (self.config.storage_driver,)
 
+        env = self.dockerd_env()
         last_error = ""
         for driver in drivers:
             argv = self.dockerd_argv(driver)
@@ -294,7 +373,7 @@ class Supervisor:
             # valuable thing in this container's output when a stack will not start,
             # and capturing it would mean holding it until something asked.
             try:
-                self.dockerd = subprocess.Popen(argv, env=self.compose_env())
+                self.dockerd = subprocess.Popen(argv, env=env)
             except OSError as e:
                 raise StackError(f"cannot execute dockerd at {DOCKERD_BIN}: {e}") from None
 
@@ -654,6 +733,7 @@ class Supervisor:
 
         try:
             self.ensure_resolver()
+            self.check_guest_kernel()
             self.phase = "dockerd"
             self.start_dockerd()
             self.phase = "loading-images"
