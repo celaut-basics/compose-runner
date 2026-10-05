@@ -33,7 +33,8 @@
         "DOCKERD_DATA_ROOT",
         "HEALTH_PORT",
         "IPTABLES_BACKEND",
-        "DNS_SERVERS"
+        "DNS_SERVERS",
+        "DOCKER_INSECURE_NO_IPTABLES_RAW"
     ],
     "network": [
         {

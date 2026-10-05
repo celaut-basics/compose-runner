@@ -278,6 +278,9 @@ class TheDeclarationListsEveryVariable(unittest.TestCase):
         # IPTABLES_BACKEND is read by entrypoint.sh rather than config.py, and is
         # declared; assert it explicitly so the shell's variable is not forgotten.
         self.assertIn("IPTABLES_BACKEND", declared)
+        # The supervisor keeps a value of this one that the operator gives, and
+        # passes it to dockerd.
+        self.assertIn(config.NO_IPTABLES_RAW_ENV, declared)
         self.assertEqual(set(), read_by_config - declared, "read but not declared")
 
 
