@@ -210,6 +210,26 @@ class SlotPorts(unittest.TestCase):
         self.assertEqual(set(), compose_spec.slot_ports(None))
 
 
+class ReservedPorts(unittest.TestCase):
+    def test_a_stack_that_does_not_publish_the_health_port_passes(self):
+        compose_spec.refuse_reserved_ports(document({"w": whoami()}), [9000])
+
+    def test_a_stack_that_publishes_the_health_port_is_refused_with_the_fix(self):
+        with self.assertRaises(ComposeSpecError) as caught:
+            compose_spec.refuse_reserved_ports(
+                document({"w": whoami(published="9000")}), [9000]
+            )
+        message = str(caught.exception)
+        self.assertIn("9000/tcp", message)
+        self.assertIn("HEALTH_PORT", message)
+
+    def test_the_same_port_on_udp_is_no_clash(self):
+        # The health slot is TCP. A UDP listener on the same number does not collide.
+        compose_spec.refuse_reserved_ports(
+            document({"w": whoami(published="9000", protocol="udp")}), [9000]
+        )
+
+
 class CrossCheck(unittest.TestCase):
     def test_a_matching_declaration_passes_and_returns_what_is_published(self):
         published = compose_spec.cross_check(document({"w": whoami()}), [{"port": 8080}])

@@ -247,6 +247,13 @@ class Main(unittest.TestCase):
         service = self.write("s.json", json.dumps({"api": [{"port": 8080}, {"port": 9000}]}))
         self.assertEqual(0, preflight.main([compose, service]))
 
+    def test_a_stack_that_publishes_the_health_port_fails_the_build(self):
+        # The health slot listens first, so `docker compose up` would fail on a bind
+        # error at runtime.
+        compose = self.write("c.yml", 'services:\n  w:\n    ports:\n      - "9000:80"\n')
+        service = self.write("s.json", json.dumps({"api": [{"port": 9000}]}))
+        self.assertEqual(1, preflight.main([compose, service]))
+
     def test_a_mismatch_the_reader_could_not_fully_parse_only_warns(self):
         # The safety valve: the reader admitted it skipped something, so the port it did
         # not find may well be published by a construct it cannot read.

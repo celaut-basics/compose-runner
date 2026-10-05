@@ -233,6 +233,18 @@ def main(argv: List[str]) -> int:
     for note in notes:
         print(f"[preflight] NOTE {note}")
 
+    clash = sorted((p, proto) for p, proto in published if proto == "tcp" and p in ignored)
+    if clash:
+        # The health slot listens on this port before the stack starts, so a
+        # container that publishes it fails `docker compose up` with a bind error.
+        sys.stderr.write(
+            f"[preflight] FAIL: {compose_path} publishes {render(clash)}, which the "
+            "health slot of this service uses.\n"
+            "Publish the stack on another port, or move the health slot "
+            "(HEALTH_PORT, service.json and preflight.health_port).\n"
+        )
+        return 1
+
     missing = {
         (port, protocol)
         for port, protocol in declared

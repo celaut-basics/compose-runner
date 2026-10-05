@@ -327,6 +327,28 @@ def cross_check(
     return published
 
 
+def refuse_reserved_ports(document: Dict[str, object], reserved: Iterable[int]) -> None:
+    """Refuse a stack that publishes a TCP port this service serves itself.
+
+    The health slot listens on its port before the stack starts. A container that
+    publishes the same port makes `docker compose up` fail on a bind error, which
+    names neither the health slot nor the fix. So the conflict is refused here, with
+    the reason, before anything starts.
+    """
+    published = published_ports(document)
+    clash = sorted(
+        (port, protocol)
+        for port, protocol in published
+        if protocol == "tcp" and port in {int(p) for p in reserved}
+    )
+    if clash:
+        raise ComposeSpecError(
+            f"the compose file publishes {_render(clash)}, which this service uses "
+            "for its own health slot. Set HEALTH_PORT to a free port, and change the "
+            "health slot in .service/service.json to the same port."
+        )
+
+
 def load_service_json(raw: object) -> Dict[str, object]:
     """`.service/service.json` as a dict, or raise with the reason.
 
