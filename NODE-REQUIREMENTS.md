@@ -384,18 +384,21 @@ runtime configuration. A line that says `ENV PATH` is lost too would help, becau
 
 Re-checked against `b2f79449`. `src/virtualizers/microvm/network.py` states that nodo
 writes no `/etc/hosts` and no `/etc/resolv.conf` into the guest, serves no DNS, and
-opens no port 53 toward the node. The exported image has no `resolv.conf` that names a
-server (Docker writes one only at `docker run`). The `*` tag opens egress to every
-address, but nothing tells a program in the guest which address to ask for a name.
+opens no port 53 toward the node. The `*` tag opens egress to every address, but the
+node does not name a resolver.
 
-So dockerd, which resolves registry names itself, fails each pull with a lookup error.
-The containers of the stack, which get their resolver from dockerd, cannot resolve
-names either.
+The pinned `debian:bookworm-slim` layer **does** ship `/etc/resolv.conf` as a regular
+file with `nameserver 1.1.1.1` and `nameserver 1.0.0.1`. That was read from `docker
+save` of the index digest in `.service/Dockerfile`, not from `docker run` (the engine
+replaces the file at create). Whether `nodo pack` keeps that file in the exported tar
+is not proven. If the packed rootfs has no nameserver, dockerd fails each pull with a
+lookup error.
 
 **What this service does about it:** before dockerd starts, the supervisor writes
 `/etc/resolv.conf` with `DNS_SERVERS` (default `1.1.1.1 8.8.8.8`) when the file names no
 server. The `*` grant makes those addresses reachable. A file that already names a
-server (the `docker run` case) is kept, unless `DNS_SERVERS` is set.
+server (the debian layer, or the `docker run` mount) is kept, unless `DNS_SERVERS` is
+set.
 
 **The gap:** the spec has no way to ask the node for a resolver, and no way to say
 which resolver a `*` service uses. A service that declares `*` and takes host names

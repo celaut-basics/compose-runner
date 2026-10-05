@@ -275,12 +275,14 @@ A hostname tag would not work. The node resolves the tag itself and opens only t
 addresses. It serves no DNS and opens no port 53. dockerd must resolve registry names
 itself.
 
-**A nodo guest has no resolver.** nodo writes no `/etc/resolv.conf`, and the image has
-none that names a server. Without one, each image pull fails with a lookup error. So,
-before dockerd starts, the supervisor writes `/etc/resolv.conf` with `DNS_SERVERS`
-when the file names no server. The `*` grant makes those public resolvers reachable.
-dockerd also gives these servers to the containers of the stack. An explicit
-`DNS_SERVERS` always replaces the file.
+**A nodo guest has no resolver from the node.** nodo writes no `/etc/resolv.conf`.
+The pinned debian base layer has `/etc/resolv.conf` as a regular file with
+`nameserver 1.1.1.1` and `nameserver 1.0.0.1` (read from `docker save`, not from
+`docker run`). The supervisor keeps a file that already names a server. If the packed
+filesystem has no nameserver, it writes `DNS_SERVERS`. An explicit `DNS_SERVERS`
+always replaces the file. The `*` grant makes those public resolvers reachable.
+dockerd also gives these servers to the containers of the stack. Whether `nodo pack`
+keeps the debian file is not proven.
 
 **You can use no egress at all.** Run `docker save` on your images into
 `stack/images/*.tar` before you pack. The supervisor loads them before compose runs.
@@ -415,8 +417,9 @@ Docker 29 in the VM) and ran it:
 - With `/var/lib/docker` on a volume (ext4, as the rootfs of a nodo guest) and an
   empty `/etc/resolv.conf`: the supervisor wrote `1.1.1.1` and `8.8.8.8`, dockerd
   started with **overlay2** (no fallback), the images were pulled through those
-  resolvers, and the stack was up in 2.6 s. Without the volume, overlay2 failed on the
-  overlay of the outer container and vfs was used, as before.
+  resolvers, and the stack was up in 2.6 s. That empty file is a test mount, not the
+  debian layer. Without the volume, overlay2 failed on the overlay of the outer
+  container and vfs was used, as before.
 - The SHA-256 of the four pinned downloads (Docker 29.8.1 and compose v5.5.1, `aarch64`
   and `x86_64`) were compared with the published artifacts. All four agree.
 
