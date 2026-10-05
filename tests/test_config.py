@@ -47,6 +47,10 @@ class Defaults(unittest.TestCase):
     def test_the_health_port_defaults_to_9000(self):
         self.assertEqual(9000, self.loaded.health_port)
 
+    def test_the_dns_servers_default_to_public_resolvers_and_are_not_explicit(self):
+        self.assertEqual(config.DEFAULT_DNS_SERVERS, self.loaded.dns_servers)
+        self.assertFalse(self.loaded.dns_servers_explicit)
+
 
 class ComposeFile(unittest.TestCase):
     def test_an_absolute_path_is_taken(self):
@@ -186,6 +190,32 @@ class DataRoot(unittest.TestCase):
             config.load({"DOCKERD_DATA_ROOT": "var/lib/docker"})
 
 
+class DnsServers(unittest.TestCase):
+    def test_space_and_comma_separated_lists_are_read(self):
+        loaded = config.load({"DNS_SERVERS": "9.9.9.9, 149.112.112.112"})
+        self.assertEqual(("9.9.9.9", "149.112.112.112"), loaded.dns_servers)
+        self.assertTrue(loaded.dns_servers_explicit)
+
+    def test_an_ipv6_address_is_taken(self):
+        self.assertEqual(("2606:4700:4700::1111",), config.load({"DNS_SERVERS": "2606:4700:4700::1111"}).dns_servers)
+
+    def test_a_host_name_is_refused(self):
+        # A resolver file cannot name its server by name: it would need a resolver.
+        with self.assertRaises(ConfigError) as caught:
+            config.load({"DNS_SERVERS": "dns.google"})
+        self.assertIn("not an IP address", str(caught.exception))
+
+    def test_more_than_three_servers_are_refused(self):
+        # glibc reads three; a fourth would be silently ignored.
+        with self.assertRaises(ConfigError):
+            config.load({"DNS_SERVERS": "1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4"})
+
+    def test_an_empty_value_is_the_default(self):
+        loaded = config.load({"DNS_SERVERS": "  "})
+        self.assertEqual(config.DEFAULT_DNS_SERVERS, loaded.dns_servers)
+        self.assertFalse(loaded.dns_servers_explicit)
+
+
 class HealthPort(unittest.TestCase):
     def test_a_port_is_taken(self):
         self.assertEqual(9999, config.load({"HEALTH_PORT": "9999"}).health_port)
@@ -243,6 +273,7 @@ class TheDeclarationListsEveryVariable(unittest.TestCase):
             "DOCKERD_STORAGE_DRIVER",
             "DOCKERD_DATA_ROOT",
             "HEALTH_PORT",
+            "DNS_SERVERS",
         }
         # IPTABLES_BACKEND is read by entrypoint.sh rather than config.py, and is
         # declared; assert it explicitly so the shell's variable is not forgotten.

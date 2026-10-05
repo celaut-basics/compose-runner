@@ -9,9 +9,10 @@ is not the limit it enforces, and the limits here are what stand between "the st
 did not start" and an instance that hangs forever holding a node's resources.
 """
 
+import ipaddress
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # Where the Dockerfile puts things. Not configurable: they are part of the
 # content-addressed filesystem, and a path that could be repointed would be a way to
@@ -23,27 +24,55 @@ DOCKERD_BIN = "/opt/docker/bin/dockerd"
 # there produced a `docker compose` that did not exist as a subcommand at all -- see the
 # comment on the COPY in .service/Dockerfile.
 COMPOSE_PLUGIN = "/usr/local/lib/docker/cli-plugins/docker-compose"
+DOCKER_INIT_BIN = "/opt/docker/bin/docker-init"
 SERVICE_JSON = "/.service/service.json"
 STACK_DIR = "/app/stack"
 DEFAULT_COMPOSE_FILE = STACK_DIR + "/docker-compose.yml"
 
+# The PATH every process of this service runs with.
+#
+# nodo does not apply the Dockerfile's `ENV` lines. The packer exports the image as a
+# filesystem only, and the guest `/init` (bash/build_ch_initramfs.sh) starts the
+# entrypoint with its own fixed PATH, which does not contain /opt/docker/bin. dockerd
+# finds `containerd`, `runc`, `docker-proxy` and the shim through PATH. So this value
+# is set by `service/entrypoint.sh` and again by the supervisor for each child.
+# `/usr/local/sbin` is first because the entrypoint puts the iptables backend links
+# there, and they must win over /usr/sbin.
+RUNTIME_PATH = "/usr/local/sbin:/opt/docker/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# The resolver file that dockerd (image pulls) and the containers of the stack read.
+RESOLV_CONF = "/etc/resolv.conf"
+
+# The name servers this service writes into RESOLV_CONF when that file names none.
+#
+# A nodo guest gets no resolver: nodo serves no DNS, writes no /etc/resolv.conf and
+# opens no port 53 of its own (src/virtualizers/microvm/network.py). The image export
+# does not carry a usable resolv.conf either. Without a name server, dockerd cannot
+# look up a registry and every image pull fails. The `*` network grant opens egress
+# to all addresses, so a public resolver is reachable. `DNS_SERVERS` replaces these.
+DEFAULT_DNS_SERVERS: Tuple[str, ...] = ("1.1.1.1", "8.8.8.8")
+
+# glibc reads at most three `nameserver` lines (MAXNS). More would be ignored.
+MAX_DNS_SERVERS = 3
+
 # Where dockerd keeps images, layers and container filesystems.
 #
-# This is the single most consequential path in the service, and it is on the **rootfs**
-# rather than under /tmp for a reason that is a fact about the node, not a preference:
+# This is the single most consequential path in the service. It is on the **rootfs**,
+# and not on a tmpfs, for a reason that is a fact about the node:
 #
-# nodo's initramfs mounts /tmp as a **tmpfs** (bash/build_ch_initramfs.sh: `mount -t
-# tmpfs -o mode=1777,nosuid,nodev tmpfs /newroot/tmp`). A tmpfs is RAM. Putting
-# /var/lib/docker there would mean every image layer the stack pulls is charged against
-# the instance's *memory* limit, not its disk -- so a 1.5 GB image on a 1 GB instance
-# does not fill a disk, it OOMs the guest. It would also make `disk_space` in
-# service.json describe nothing the service uses.
+# A tmpfs is RAM. nodo's initramfs always mounts /run as a tmpfs, and mounts /tmp as a
+# tmpfs when the rootfs is read-only (bash/build_ch_initramfs.sh). A data-root on a
+# tmpfs would charge every image layer the stack pulls against the instance's *memory*
+# limit, not its disk. A 1.5 GB image on a 1 GB instance would not fill a disk, it
+# would OOM the guest. Also, `disk_space` in service.json would then describe nothing
+# the service uses.
 #
-# The rootfs is writable ext4 on the ordinary path, sized to at least
-# `at_init.disk_space` (src/virtualizers/microvm/limits.py: `initial_rootfs_size_bytes`
-# floors the image at the declared figure), which is exactly the property dockerd needs
-# and exactly what the declared 4 GB is for. See NODE-REQUIREMENTS.md for why this
-# service therefore cannot declare `read_only_filesystem: true`.
+# The rootfs is writable ext4 on the ordinary path. Its size is fixed at boot to at
+# least `at_init.disk_space` (src/virtualizers/microvm/limits.py:
+# `initial_rootfs_size_bytes`). That is the property dockerd needs, and it is what the
+# declared figure is for. `at_most.disk_space` does not grow this disk. See
+# NODE-REQUIREMENTS.md for why this service cannot declare
+# `read_only_filesystem: true`.
 DEFAULT_DATA_ROOT = "/var/lib/docker"
 
 # The health slot. Its own port, and 9000 rather than 8080 so the example stack's own
@@ -120,6 +149,38 @@ class Config:
     data_root: str
     health_port: int
     down_timeout_s: int
+    # The name servers to write into RESOLV_CONF, and whether the operator set them.
+    # An explicit value replaces a resolv.conf that already names servers. The
+    # default only fills a resolv.conf that names none.
+    dns_servers: Tuple[str, ...] = DEFAULT_DNS_SERVERS
+    dns_servers_explicit: bool = False
+
+
+def _dns_servers(raw: Optional[str]) -> Tuple[Tuple[str, ...], bool]:
+    """`DNS_SERVERS` as a tuple of IP addresses, and whether it was set.
+
+    Separated by spaces or commas. Each entry must be an IPv4 or IPv6 address: a
+    resolver file cannot name a server by host name, because it would need a resolver
+    to find it.
+    """
+    text = (raw or "").replace(",", " ").split()
+    if not text:
+        return DEFAULT_DNS_SERVERS, False
+    if len(text) > MAX_DNS_SERVERS:
+        raise ConfigError(
+            f"DNS_SERVERS names {len(text)} servers. The resolver reads at most "
+            f"{MAX_DNS_SERVERS}; give {MAX_DNS_SERVERS} or fewer."
+        )
+    servers = []
+    for item in text:
+        try:
+            servers.append(str(ipaddress.ip_address(item)))
+        except ValueError:
+            raise ConfigError(
+                f"DNS_SERVERS entry {item!r} is not an IP address. A resolver file "
+                "cannot name a server by host name."
+            ) from None
+    return tuple(servers), True
 
 
 def load(env: Optional[Dict[str, str]] = None) -> Config:
@@ -157,9 +218,9 @@ def load(env: Optional[Dict[str, str]] = None) -> Config:
     # "the runtime never came up" from "the stack never came up".
     dockerd_timeout_s = _int_env(env, "DOCKERD_TIMEOUT_S", default=60, minimum=5, maximum=600)
 
-    # How long `docker compose down` is given on SIGTERM. Below the node's own kill
-    # grace by default, so a clean shutdown is normally what happens rather than a
-    # SIGKILL landing mid-teardown and leaving the containers' state half-written.
+    # How long `docker compose down` is given on SIGTERM. Below the 90 s that
+    # tests/test_image.sh gives `docker stop`. Under nodo no SIGTERM arrives: `nodo
+    # kill` stops the whole VM, so this applies to `docker stop` and other runtimes.
     down_timeout_s = _int_env(env, "COMPOSE_DOWN_TIMEOUT_S", default=30, minimum=1, maximum=600)
 
     storage_driver = (env.get("DOCKERD_STORAGE_DRIVER") or "auto").strip().lower()
@@ -177,6 +238,8 @@ def load(env: Optional[Dict[str, str]] = None) -> Config:
         env, "HEALTH_PORT", default=DEFAULT_HEALTH_PORT, minimum=1, maximum=65535
     )
 
+    dns_servers, dns_servers_explicit = _dns_servers(env.get("DNS_SERVERS"))
+
     return Config(
         project_name=_project_name(env.get("COMPOSE_PROJECT_NAME")),
         compose_file=compose_file,
@@ -186,4 +249,6 @@ def load(env: Optional[Dict[str, str]] = None) -> Config:
         data_root=data_root,
         health_port=health_port,
         down_timeout_s=down_timeout_s,
+        dns_servers=dns_servers,
+        dns_servers_explicit=dns_servers_explicit,
     )
