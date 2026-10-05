@@ -56,6 +56,17 @@ The parts:
 BuildKit secrets, swarm or overlay networks, and per-container CPU limits (the guest
 kernel cannot enforce them, see [finding 1](NODE-REQUIREMENTS.md)).
 
+**The guest kernel has two more gaps** ([finding 8](NODE-REQUIREMENTS.md)), found by
+resolving its configuration for both architectures:
+
+- No iptables `raw` table, on arm64 and x86_64. dockerd 28+ needs it for each
+  container. The supervisor detects this and starts dockerd with
+  `DOCKER_INSECURE_NO_IPTABLES_RAW=1`.
+- No `bpf(2)` on **x86_64**. On cgroup v2, runc then refuses each container that is
+  not privileged. The service cannot fix this; it logs a warning. Until the nodo guest
+  kernel has `CONFIG_BPF_SYSCALL`, use an arm64 node, or a stack of privileged
+  containers.
+
 ## Use it with your own stack
 
 You need a nodo with a packer backend (see `docs/skill/SKILL.md` and
@@ -80,8 +91,11 @@ You need a nodo with a packer backend (see `docs/skill/SKILL.md` and
      the compose file. Keep the health slot (9000).
    - Set `architecture` to the architecture of the host that packs and runs it
      (`linux/arm64` or `linux/amd64`). The Dockerfile has pinned checksums for both.
-   - Add to `envs` each variable of your stack that you want to set at launch.
-     A variable that is not in `envs` cannot be given with `nodo execute -e`.
+     **On an x86_64 node, the current guest kernel cannot start a container that is
+     not privileged** ([finding 8](NODE-REQUIREMENTS.md)).
+   - Add to `envs` each variable of your stack that you want to set at launch. nodo
+     does not enforce this list: `nodo execute -e` gives any variable. The list tells
+     the reader of `service.json` which names the service reads.
    - Raise `resources.at_init.disk_space` if your images are large. See
      [Resources](#resources).
 
@@ -205,8 +219,10 @@ does not start a burst of processes.
 
 ## The environment it reads
 
-Set these with `nodo execute -e <name> <value>`. nodo gives each declared name to the
-entrypoint as a real environment variable, and also in `__config__`.
+Set these with `nodo execute -e <name> <value>`. nodo puts each variable in
+`__config__`. It also gives it to the entrypoint as a real environment variable, if the
+name is a C identifier, is not reserved (`PATH`, `LD_PRELOAD` and some others), and the
+value is at most 32 KiB (`src/utils/guest_env.py` in nodo).
 
 | variable | default | what it is |
 |---|---|---|
@@ -220,12 +236,13 @@ entrypoint as a real environment variable, and also in `__config__`.
 | `DNS_SERVERS` | `1.1.1.1 8.8.8.8` | Up to three IP addresses for `/etc/resolv.conf`. See [The network](#the-network-it-asks-for). |
 | `HEALTH_PORT` | `9000` | The health slot. Must match the slot in `service.json`. |
 | `IPTABLES_BACKEND` | `legacy` | `legacy` \| `nft`. Read by the entrypoint. [Finding 1](NODE-REQUIREMENTS.md) explains the default. |
+| `DOCKER_INSECURE_NO_IPTABLES_RAW` | set to `1` only if the kernel has no iptables `raw` table | Read by dockerd. The supervisor sets it when `iptables -t raw -S` fails, and keeps a value that you give. [Finding 8](NODE-REQUIREMENTS.md). |
 
 A value that is not valid stops the service at start, with the reason. For example,
 `COMPOSE_UP_TIMEOUT_S=abc` is refused. It does not become 600.
 
-**Your stack's own variables** go in `stack/.env` (compose reads it), or in `envs` if
-you want to set them at launch. The children of the supervisor **inherit** its
+**Your stack's own variables** go in `stack/.env` (compose reads it), or you give them
+at launch with `-e` (and list them in `envs`). The children of the supervisor **inherit** its
 environment, so `${VAR}` interpolation in the compose file sees those values. The
 supervisor sets `DOCKER_HOST` and `PATH` itself, so an inherited value cannot send
 the stack to another daemon.
@@ -315,7 +332,7 @@ CVE-2024-3094).
 ## Tests
 
 ```sh
-sh tests/run.sh          # 240 offline tests, about 6 s, no Docker
+sh tests/run.sh          # 250 offline tests, about 6 s, no Docker
 sh tests/test_image.sh   # 41 checks on a built image; needs --privileged and the network
 ```
 
@@ -340,7 +357,7 @@ What they cover:
   2 s cache.
 - **The supervisor** (`test_supervisor.py`), with each subprocess replaced: the
   overlay2 to vfs fallback, argv always a list, `DOCKER_HOST` and `PATH` not
-  inherited, the resolver file, the health phases, a packed tar that fails to load is
+  inherited, the `raw` table switch and the `bpf(2)` warning, the resolver file, the health phases, a packed tar that fails to load is
   fatal, and SIGTERM becomes `compose down`.
 - **The build-time reader** (`test_preflight.py`). A construct that it cannot parse
   gives a note, and a note turns a failure into a warning. A partial parser must not

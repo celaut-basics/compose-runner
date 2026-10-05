@@ -1,4 +1,4 @@
-# What this service needs from the node, and seven things the spec cannot express
+# What this service needs from the node, and eight things the spec cannot express
 
 `compose-runner` asks for more than any other service in `celaut-basics`, because it
 runs a container runtime inside the sandbox rather than a program. This is the list of
@@ -7,7 +7,8 @@ service — written down because they were found by building against
 [`celaut-project/nodo`](https://github.com/celaut-project/nodo) at `upstream/dev`
 (`306e3531`), and because the first one would silently produce a stack with no egress at
 all. Findings 6 and 7, and the corrections marked "Re-checked", come from a review
-against nodo `dev` at `b2f79449`.
+against nodo `dev` at `b2f79449`. Finding 8 and the per-architecture corrections come
+from an audit against nodo `dev` at `698e6583`.
 
 Everything below about the guest kernel was resolved by running Kconfig itself, not by
 reading the fragment: `make ARCH=arm64 defconfig && make ARCH=arm64 kvm_guest.config`
@@ -15,6 +16,14 @@ then `merge_config.sh` with `bash/guest-kernel/nodo-guest.config` and
 `nodo-guest-arm64.config`, then `olddefconfig`, on linux 6.12.103 — the version
 `bash/guest-kernel/build.sh:18` pins. A fragment entry is a *request*: Kconfig silently
 drops any symbol whose dependencies are unmet, which is exactly what finding 1 is.
+
+The first resolution was for **arm64 only**. The audit at `698e6583` resolved the same
+steps for **x86_64** too (`ARCH=x86_64`, `nodo-guest-x86_64.config`, the sequence of
+`bash/guest-kernel/build.sh:82-87`). The two kernels are not the same. The x86_64
+`defconfig` has no BPF, so the x86_64 guest has no `CONFIG_BPF_SYSCALL` and no
+`CONFIG_CGROUP_BPF`. Finding 8 explains what that stops. The x86_64 configuration was
+resolved on an arm64 host. That changes no symbol in this file, because none of them
+depends on the compiler.
 
 ## From the node
 
@@ -32,7 +41,8 @@ drops any symbol whose dependencies are unmet, which is exactly what finding 1 i
 
 **KVM, and a guest kernel built from this checkout's fragment.** Nothing else — no
 device node, no module, no native application. The kernel features are all present
-except the one in finding 1.
+except the ones in findings 1 and 8. On an **x86_64** node, finding 8 is a blocker:
+each container that is not privileged fails to start.
 
 **Not a GPU.** `celaut.Sysresources` has `mem_limit`, `disk_space`, `cpu_period`,
 `cpu_quota` and `blkio_weight` and no accelerator field, so a stack needing one could
@@ -161,8 +171,12 @@ is set, so cpu *shares* work, but `cpu.max` does not exist, so `cpus:` or
 whole is still limited by the node, so this is a fairness question inside the stack
 rather than an escape.
 
-**Everything else dockerd needs is present**, and it is worth recording as verified
-rather than assumed: `CONFIG_OVERLAY_FS`, `CONFIG_NAMESPACES`, `CONFIG_NET_NS`,
+**Everything else dockerd needs is present on arm64**, and it is worth recording as
+verified rather than assumed. On **x86_64**, six symbols of this list are absent:
+`CONFIG_CGROUP_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BRIDGE_VLAN_FILTERING`,
+`CONFIG_MACVLAN`, `CONFIG_IP_VS` and `CONFIG_IP6_NF_NAT` (not in the list, but present
+on arm64). The first two are finding 8. The others are not used by a single-node stack
+on the default bridge network. The list: `CONFIG_OVERLAY_FS`, `CONFIG_NAMESPACES`, `CONFIG_NET_NS`,
 `CONFIG_USER_NS`, `CONFIG_PID_NS`, `CONFIG_IPC_NS`, `CONFIG_UTS_NS`, `CONFIG_CGROUPS`,
 `CONFIG_CGROUP_PIDS`, `CONFIG_CGROUP_DEVICE`, `CONFIG_CGROUP_FREEZER`,
 `CONFIG_CGROUP_SCHED`, `CONFIG_CGROUP_CPUACCT`, `CONFIG_MEMCG`, `CONFIG_BLK_CGROUP`,
@@ -386,6 +400,57 @@ server (the `docker run` case) is kept, unless `DNS_SERVERS` is set.
 **The gap:** the spec has no way to ask the node for a resolver, and no way to say
 which resolver a `*` service uses. A service that declares `*` and takes host names
 must bring its own, as this one does.
+
+## 8. The guest kernel misses two things that runc and dockerd 28+ use
+
+Found by the audit against `698e6583`, by Kconfig resolution of both architectures (see
+the top of this file). Neither is in an earlier finding, and the runs under
+`docker run --privileged` could not show them, because the host kernel had both.
+
+**a. No `raw` table (`CONFIG_IP_NF_RAW`), on arm64 and on x86_64.** Nothing in
+`bash/guest-kernel/nodo-guest.config:98-112` asks for it, and neither `defconfig` sets
+it. dockerd 28.0 and later writes a DROP rule in the `raw` table for each container
+endpoint on a bridge network. In moby `docker-v29.8.1`, the rule is in
+`daemon/libnetwork/drivers/bridge/internal/iptabler/endpoint.go`
+(`filterDirectAccess`), and `appendOrDelChainRule` returns the iptables error. So with
+no `raw` table, each container of the stack fails to start. The only switch is the
+environment variable `DOCKER_INSECURE_NO_IPTABLES_RAW=1`
+(`iptabler/port.go`, `rawRulesDisabled`).
+
+**What this service does about it:** the supervisor reads the `raw` table with the
+selected `iptables` (`iptables -t raw -S`). If that fails, it starts dockerd with
+`DOCKER_INSECURE_NO_IPTABLES_RAW=1` and logs a warning. A value set at launch is kept.
+The cost: dockerd does not block packets that a host on the same link sends straight to
+a container address. In a nodo guest that link is the node's bridge, and the node
+firewall blocks traffic between instances (`src/virtualizers/microvm/network.py`,
+`configure_guest_firewall_policy`, default deny).
+
+**b. No `bpf(2)` on x86_64 (`CONFIG_BPF_SYSCALL`, and so no `CONFIG_CGROUP_BPF`).**
+The x86_64 `defconfig` of linux 6.12.103 sets no BPF option, and the fragment asks for
+none. The arm64 `defconfig` sets `CONFIG_BPF_SYSCALL=y`, so the arm64 guest has it. On
+cgroup v2, which nodo's `/init` mounts (`bash/build_ch_initramfs.sh:373-375`), runc
+applies the device rules of a container with an eBPF program. If the program cannot be
+loaded, runc refuses the container unless every rule allows everything
+(`opencontainers/cgroups`, `devices/v2.go`, `setV2` and `canSkipEBPFError`). A default
+container has deny rules. So on an x86_64 node, each container that is not
+`privileged: true` fails to start.
+
+There is no fix inside the service. The cgroup v1 devices controller needs no eBPF, but
+a remount to cgroup v1 is not a fix either: the guest has no `CONFIG_MEMCG_V1`, so v1
+has no memory controller. **What this service does:** the supervisor logs a warning
+before dockerd starts, when cgroup v2 is mounted and
+`/proc/sys/kernel/unprivileged_bpf_disabled` is missing (that sysctl exists only with
+`CONFIG_BPF_SYSCALL`). Then the runc error that follows has its cause next to it.
+
+**What nodo could do about it:** add `CONFIG_BPF_SYSCALL=y`, `CONFIG_CGROUP_BPF=y` and
+`CONFIG_IP_NF_RAW=y` to `bash/guest-kernel/nodo-guest.config`, in the block that says
+"Containers inside the guest: a service may boot its own dockerd", and add them to the
+`assert_config` loop of `bash/guest-kernel/build.sh`. That loop does not check
+`CONFIG_NFT_NAT` either (finding 1).
+
+**Not verified:** no guest booted. The evidence is the resolved `.config` and the moby
+and runc source. A boot of the x86_64 guest kernel with this stack is the test that
+confirms it.
 
 ## Also re-checked: how an instance stops
 
