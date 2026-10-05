@@ -195,6 +195,84 @@ class Provider(unittest.TestCase):
         self.assertIsInstance(seen["argv"], list)
 
 
+    def test_the_default_runner_passes_the_given_environment(self):
+        # Under nodo the supervisor's own environment has no DOCKER_HOST, and the
+        # health thread must reach the daemon the supervisor started.
+        seen = {}
+        original = health.subprocess.run
+
+        class Completed:
+            returncode, stdout, stderr = 0, "[]", ""
+
+        def fake_run(command, **kwargs):
+            seen.update(kwargs)
+            return Completed()
+
+        health.subprocess.run = fake_run
+        try:
+            provider = health.compose_ps_provider(
+                ["docker", "compose", "ps"], env={"DOCKER_HOST": "unix:///run/docker.sock"}
+            )
+            provider()
+        finally:
+            health.subprocess.run = original
+        self.assertEqual({"DOCKER_HOST": "unix:///run/docker.sock"}, seen["env"])
+        self.assertEqual(health.PS_TIMEOUT_S, seen["timeout"])
+
+
+class Cache(unittest.TestCase):
+    """One `docker compose ps` serves every request inside the TTL."""
+
+    def setUp(self):
+        self.now = [100.0]
+        self.calls = []
+
+        def provider():
+            self.calls.append(self.now[0])
+            return 200, {"status": "ok", "n": len(self.calls)}
+
+        self.cached = health.cached(provider, ttl_s=2.0, clock=lambda: self.now[0])
+
+    def test_a_second_request_inside_the_ttl_reuses_the_answer(self):
+        self.cached()
+        self.now[0] += 1.0
+        code, document = self.cached()
+        self.assertEqual(1, len(self.calls))
+        self.assertEqual((200, 1), (code, document["n"]))
+
+    def test_a_request_after_the_ttl_asks_again(self):
+        self.cached()
+        self.now[0] += 2.5
+        self.cached()
+        self.assertEqual(2, len(self.calls))
+
+    def test_the_caller_gets_a_copy_it_may_change(self):
+        _, first = self.cached()
+        first["n"] = 99
+        _, second = self.cached()
+        self.assertEqual(1, second["n"])
+
+    def test_concurrent_requests_share_one_call(self):
+        import threading
+
+        gate = threading.Event()
+        calls = []
+
+        def slow():
+            calls.append(1)
+            gate.wait(5)
+            return 200, {}
+
+        wrapper = health.cached(slow, ttl_s=60.0)
+        threads = [threading.Thread(target=wrapper) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        gate.set()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(1, len(calls))
+
+
 class Server(unittest.TestCase):
     """The HTTP contract, against a real socket on a real port."""
 

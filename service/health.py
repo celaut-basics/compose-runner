@@ -24,6 +24,7 @@ would be the largest dependency in the service.
 import json
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -32,6 +33,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 # on an unresponsive dockerd must not wedge the health check too, or the one endpoint
 # that exists to report trouble becomes the one that hangs during it.
 PS_TIMEOUT_S = 10
+
+# How long one `docker compose ps` answer is reused. The slot is reachable from
+# outside the instance, and each uncached request would start a Go binary of 30 MB. A
+# burst of requests must not become a burst of processes. Two seconds is short next
+# to any useful probe interval.
+CACHE_TTL_S = 2.0
 
 # What `docker compose ps --format json` reports in `State` for a container that is
 # up. Compose reports container state, not a health check, unless the compose file
@@ -201,6 +208,7 @@ def compose_ps_provider(
     argv: List[str],
     expected: int = 0,
     runner: Optional[Callable[[List[str]], Tuple[int, str, str]]] = None,
+    env: Optional[Dict[str, str]] = None,
 ) -> Callable[[], Tuple[int, Dict[str, object]]]:
     """A status provider that shells out to `docker compose ps` and summarises it.
 
@@ -216,10 +224,10 @@ def compose_ps_provider(
                 capture_output=True,
                 text=True,
                 timeout=PS_TIMEOUT_S,
-                # A replaced-but-minimal env is not used here: `docker compose` needs
-                # DOCKER_HOST and PATH from the entrypoint's environment to find the
-                # daemon it was told about. Inheriting is the correct behaviour for a
-                # child of the supervisor that configured it.
+                # The supervisor's compose environment: DOCKER_HOST names the daemon
+                # it started, and PATH holds the Docker binaries. Neither is in this
+                # process's own environment under nodo.
+                env=env,
             )
         except subprocess.TimeoutExpired:
             return 124, "", f"`docker compose ps` did not answer within {PS_TIMEOUT_S}s"
@@ -245,6 +253,32 @@ def compose_ps_provider(
     return provider
 
 
+def cached(
+    provider: Callable[[], Tuple[int, Dict[str, object]]],
+    ttl_s: float = CACHE_TTL_S,
+    clock: Callable[[], float] = time.monotonic,
+) -> Callable[[], Tuple[int, Dict[str, object]]]:
+    """Wrap a provider so that one answer serves every request for `ttl_s` seconds.
+
+    A lock makes concurrent requests wait for one call instead of starting one call
+    each. `clock` is injected for the tests.
+    """
+    lock = threading.Lock()
+    state: Dict[str, object] = {"at": None, "answer": None}
+
+    def wrapper() -> Tuple[int, Dict[str, object]]:
+        with lock:
+            at = state["at"]
+            now = clock()
+            if at is None or now - at >= ttl_s:  # type: ignore[operator]
+                state["answer"] = provider()
+                state["at"] = clock()
+            code, document = state["answer"]  # type: ignore[misc]
+            return code, dict(document)
+
+    return wrapper
+
+
 def serve(
     port: int,
     status_provider: Callable[[], Tuple[int, Dict[str, object]]],
@@ -252,9 +286,8 @@ def serve(
     """Start the health server on a daemon thread and return it.
 
     A thread rather than a process, and a daemon thread rather than a joined one: the
-    supervisor in `entrypoint.sh`'s Python half owns the process lifetime, and a
-    health server outliving the supervisor would keep an instance reporting on a stack
-    nobody is watching.
+    supervisor owns the process lifetime, and a health server outliving the supervisor
+    would keep an instance reporting on a stack nobody is watching.
 
     Bound to 0.0.0.0 because the point of this port is to be reached from outside the
     microVM, which is where every caller is.
