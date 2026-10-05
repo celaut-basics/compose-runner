@@ -166,6 +166,19 @@ class ComposeEnvironment(unittest.TestCase):
     def test_progress_output_is_plain_because_the_console_is_not_a_terminal(self):
         self.assertEqual("plain", self.supervisor.compose_env()["COMPOSE_PROGRESS"])
 
+    def test_path_is_set_and_not_inherited(self):
+        # nodo's /init starts the entrypoint with a PATH that has no /opt/docker/bin,
+        # and the Dockerfile's ENV is not applied. dockerd finds containerd, runc and
+        # docker-proxy through PATH, so the supervisor sets it for every child.
+        previous = os.environ.get("PATH")
+        os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        try:
+            env = self.supervisor.compose_env()
+        finally:
+            os.environ["PATH"] = previous
+        self.assertEqual(config.RUNTIME_PATH, env["PATH"])
+        self.assertIn("/opt/docker/bin", env["PATH"].split(":"))
+
 
 class StorageDriverFallback(unittest.TestCase):
     """The overlay2 -> vfs fallback, which is the one runtime adaptation this makes."""
@@ -257,29 +270,120 @@ class Signals(unittest.TestCase):
         self.assertEqual(1, self.supervisor.supervise())
 
 
-class Reaping(unittest.TestCase):
-    def test_reap_returns_zero_when_there_is_nothing_to_reap(self):
-        # ECHILD is the ordinary answer, not an error: a PID 1 with no children must not
-        # treat "nothing to reap" as a failure.
-        self.assertEqual(0, Supervisor(make_config()).reap())
+class Resolver(unittest.TestCase):
+    """The resolver file, which a nodo guest does not get from the node."""
 
-    def test_reap_counts_an_exited_child(self):
-        # A real forked child, reaped through the same path PID 1 would use for an
-        # orphaned docker-proxy.
-        sup = Supervisor(make_config())
-        pid = os.fork()
-        if pid == 0:
-            os._exit(0)
-        # The child may not have exited yet; reap until it is gone or we give up.
-        import time
+    def setUp(self):
+        import tempfile
 
-        reaped = 0
-        deadline = time.monotonic() + 5
-        while reaped == 0 and time.monotonic() < deadline:
-            reaped = sup.reap()
-            if reaped == 0:
-                time.sleep(0.05)
-        self.assertEqual(1, reaped)
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "resolv.conf")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def _read(self):
+        with open(self.path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_a_missing_file_gets_the_default_servers(self):
+        self.assertTrue(Supervisor(make_config()).ensure_resolver(self.path))
+        text = self._read()
+        for server in config.DEFAULT_DNS_SERVERS:
+            self.assertIn(f"nameserver {server}\n", text)
+
+    def test_a_file_with_no_nameserver_is_filled(self):
+        # The shape of an image export: the file can exist and name no server.
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write("# empty\nsearch example\n")
+        self.assertTrue(Supervisor(make_config()).ensure_resolver(self.path))
+        self.assertIn("nameserver 1.1.1.1", self._read())
+
+    def test_a_file_that_names_a_server_is_kept(self):
+        # The shape of `docker run`, where Docker mounts its own resolv.conf.
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write("nameserver 192.0.2.53\n")
+        self.assertFalse(Supervisor(make_config()).ensure_resolver(self.path))
+        self.assertEqual("nameserver 192.0.2.53\n", self._read())
+
+    def test_an_explicit_setting_replaces_a_file_that_names_a_server(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write("nameserver 192.0.2.53\n")
+        sup = Supervisor(
+            make_config(dns_servers=("9.9.9.9",), dns_servers_explicit=True)
+        )
+        self.assertTrue(sup.ensure_resolver(self.path))
+        text = self._read()
+        self.assertIn("nameserver 9.9.9.9\n", text)
+        self.assertNotIn("192.0.2.53", text)
+
+    def test_a_file_that_cannot_be_written_is_not_fatal(self):
+        # A stack with packed image tars needs no resolver, so this only warns.
+        path = os.path.join(self.directory.name, "missing-dir", "resolv.conf")
+        self.assertFalse(Supervisor(make_config()).ensure_resolver(path))
+
+
+class HealthPhases(unittest.TestCase):
+    """The health slot answers from the first second, with the phase."""
+
+    def setUp(self):
+        self.supervisor = Supervisor(make_config())
+
+    def test_before_the_project_is_known_it_reports_the_phase_only(self):
+        self.supervisor.phase = "dockerd"
+        code, document = self.supervisor.health_status()
+        self.assertEqual(503, code)
+        self.assertEqual({"status": "starting", "phase": "dockerd"}, document)
+
+    def test_a_failed_launch_says_failed(self):
+        self.supervisor.phase = "failed"
+        code, document = self.supervisor.health_status()
+        self.assertEqual(503, code)
+        self.assertEqual("failed", document["status"])
+
+    def test_a_failed_launch_says_failed_even_with_containers_known(self):
+        # A failure during `up` must not report the half-started containers as ok.
+        self.supervisor.phase = "failed"
+        self.supervisor._ps_provider = lambda: (200, {"status": "ok"})
+        code, document = self.supervisor.health_status()
+        self.assertEqual((503, "failed"), (code, document["status"]))
+
+    def test_containers_are_reported_once_the_project_is_known(self):
+        self.supervisor.phase = "running"
+        self.supervisor._ps_provider = lambda: (200, {"status": "ok", "running": 2})
+        code, document = self.supervisor.health_status()
+        self.assertEqual(200, code)
+        self.assertEqual("running", document["phase"])
+        self.assertEqual(2, document["running"])
+
+    def test_all_up_during_compose_up_is_still_not_ready(self):
+        # `up --wait` has not returned, so the supervisor has not accepted the stack.
+        self.supervisor.phase = "compose-up"
+        self.supervisor._ps_provider = lambda: (200, {"status": "ok"})
+        code, document = self.supervisor.health_status()
+        self.assertEqual(503, code)
+        self.assertEqual("starting", document["status"])
+
+    def test_the_container_provider_uses_the_compose_environment(self):
+        # The health thread must reach the daemon the supervisor started, with the
+        # PATH that holds the Docker binaries.
+        seen = {}
+
+        def fake_provider(argv, expected=0, runner=None, env=None):
+            seen["argv"], seen["expected"], seen["env"] = argv, expected, env
+            return lambda: (200, {})
+
+        original = supervisor.health.compose_ps_provider
+        supervisor.health.compose_ps_provider = fake_provider
+        try:
+            self.supervisor._expected_services = 2
+            self.supervisor.enable_container_health()
+        finally:
+            supervisor.health.compose_ps_provider = original
+        self.assertEqual("unix:///run/docker.sock", seen["env"]["DOCKER_HOST"])
+        self.assertEqual(config.RUNTIME_PATH, seen["env"]["PATH"])
+        self.assertEqual(2, seen["expected"])
+        self.assertIn("ps", seen["argv"])
 
 
 class Validation(unittest.TestCase):
@@ -314,6 +418,19 @@ class Validation(unittest.TestCase):
         self.supervisor.read_service_json = lambda: {}
         self.supervisor.validate()
         self.assertEqual(3, self.supervisor._expected_services)
+
+    def test_a_stack_that_publishes_the_health_port_is_refused(self):
+        # The health slot binds first, so compose would fail later on a bind error
+        # that names neither the slot nor the fix.
+        self.supervisor.read_compose_document = lambda: {
+            "services": {
+                "w": {"image": "x", "ports": [{"target": 80, "published": "9000", "protocol": "tcp"}]}
+            }
+        }
+        self.supervisor.read_service_json = lambda: {}
+        with self.assertRaises(compose_spec.ComposeSpecError) as caught:
+            self.supervisor.validate()
+        self.assertIn("HEALTH_PORT", str(caught.exception))
 
     def test_a_declaration_with_no_api_skips_the_cross_check(self):
         self.supervisor.read_compose_document = lambda: {"services": {"a": {"image": "x"}}}

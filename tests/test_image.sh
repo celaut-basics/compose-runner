@@ -6,7 +6,7 @@
 #
 #     sh tests/test_image.sh
 #
-# Build the image first:
+# Build the image first (use linux/amd64 and PLATFORM=linux/amd64 on an x86_64 host):
 #     docker buildx build --platform linux/arm64 -f .service/Dockerfile -t compose-runner:test --load .
 #
 # **`--privileged` is required and is not a test shortcut.** dockerd has to create a
@@ -28,6 +28,10 @@ PLATFORM=${PLATFORM:-linux/arm64}
 NAME="compose-runner-test-$$"
 STACK_PORT=${STACK_PORT:-18080}
 HEALTH_PORT=${HEALTH_PORT:-19000}
+# The PATH that nodo's guest /init gives the entrypoint (bash/build_ch_initramfs.sh).
+# The image's own `ENV PATH` is not applied under nodo, so the service is started with
+# this one, and must set its own PATH to work.
+NODO_INIT_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Generous, because this pulls two images on a cold Docker-in-Docker: the inner daemon
 # has no layer cache of its own, ever, since its data-root is created fresh per run.
 READY_TIMEOUT=${READY_TIMEOUT:-180}
@@ -118,6 +122,7 @@ echo "dockerd starts and the stack comes up:"
 # CMD, because the packer exports the built image as a *filesystem* and what gets exec'd
 # comes from `init.entry_path` in service.json.
 docker run -d --name "$NAME" --privileged --platform "$PLATFORM" \
+    -e "PATH=$NODO_INIT_PATH" \
     -p "127.0.0.1:${STACK_PORT}:8080" \
     -p "127.0.0.1:${HEALTH_PORT}:9000" \
     --entrypoint /service/entrypoint.sh "$IMAGE" >/dev/null
@@ -168,6 +173,19 @@ if docker logs "$NAME" 2>&1 | grep -qE "storage-driver=(overlay2|vfs)$"; then
     ok "the storage driver in use is named in the log"
 else
     no "the storage driver in use is named in the log"
+fi
+
+# tini reaps the orphans and forwards signals; the supervisor is its child.
+if [ "$(docker exec "$NAME" cat /proc/1/comm 2>/dev/null)" = "docker-init" ]; then
+    ok "PID 1 is docker-init (tini)"
+else
+    no "PID 1 is docker-init (tini)"
+fi
+
+if echo "$health_body" | grep -q '"phase": *"running"'; then
+    ok "/health reports the running phase"
+else
+    no "/health reports the running phase"
 fi
 
 if docker logs "$NAME" 2>&1 | grep -q "iptables backend: legacy"; then
@@ -340,6 +358,7 @@ MISMATCH
 # race-free: the file is in place before the entrypoint has run at all. Copying the
 # directory (not the file) creates `/app/other` in one step.
 docker create --name "$mismatch_name" --privileged --platform "$PLATFORM" \
+    -e "PATH=$NODO_INIT_PATH" \
     -e COMPOSE_FILE=/app/other/docker-compose.yml \
     --entrypoint /service/entrypoint.sh "$IMAGE" >/dev/null
 docker cp "$mismatch_dir" "$mismatch_name:/app/other" >/dev/null

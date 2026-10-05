@@ -1,31 +1,32 @@
-"""PID 1 for a compose stack: start dockerd, bring the stack up, supervise, tear down.
+"""The supervisor of a compose stack: start dockerd, bring the stack up, watch it.
 
-This is the program `service/entrypoint.sh` execs, and under nodo it is PID 1 in the
-guest with no init system underneath it (`bash/build_ch_initramfs.sh` does
-`exec switch_root /newroot "$ENTRYPOINT"`). That shapes every decision here:
+`service/entrypoint.sh` starts this program under `docker-init` (tini, from the
+Docker static bundle), and tini is PID 1. Under nodo there is no init system in the
+guest: `bash/build_ch_initramfs.sh` does `exec switch_root /newroot "$ENTRYPOINT"`.
+That shapes the design:
 
-* **nothing reaps for us.** dockerd, containerd, every `runc` and every
-  `docker-proxy` become children of this process tree, and a PID 1 that does not reap
-  leaves zombies until the pid table fills. So this process reaps, explicitly.
-* **nothing forwards signals for us.** `docker stop` on the outside and the node's own
-  teardown both arrive as SIGTERM to PID 1. If that is not turned into
-  `docker compose down`, the containers are SIGKILLed with the VM and the stack's
-  shutdown hooks never run.
-* **if this exits, the kernel panics.** So an unexpected exception here must exit with
-  a status and a logged reason, never propagate a traceback out of an unhandled thread.
+* **tini reaps, not this process.** dockerd, containerd, every `runc` and every
+  `docker-proxy` make orphans, and a PID 1 that does not reap them fills the pid
+  table. A reap loop in this process (`waitpid(-1)`) would also take the exit status
+  of the `docker compose ps` children that the health thread starts. tini does the
+  reaping, so this process waits only for its own children.
+* **if this exits, the guest kernel panics.** tini exits with this process's status,
+  and PID 1 exits. nodo reads the panic from the serial log and removes the instance
+  (src/virtualizers/microvm/guest_panic.py). So a fatal error here is an exit with a
+  logged reason, and that exit is how the node learns the instance is dead.
+* **nodo sends no signal to stop an instance.** `nodo kill` sends SIGKILL to the
+  hypervisor process (src/virtualizers/microvm/kill.py), and the guest disk goes with
+  it. The SIGTERM handler below is for `docker stop` in local tests and for other
+  runtimes. It is not a shutdown hook on a node.
 
-Python rather than shell for this half, for one reason: it is supervision logic with
-timeouts, a signal handler, a subprocess tree and a cross-check against JSON, and every
-one of those in POSIX sh is a construct that is either wrong at the edges or
-unreadable. The shell half is kept to what a shell is actually better at -- being the
-`entry_path` the node execs, checking the image is what it thinks it is, and handing
-over.
+Python rather than shell for this half: it is supervision logic with timeouts, a
+signal handler, a subprocess tree and a cross-check against JSON. The shell half
+selects the iptables backend, sets PATH and starts this program.
 
 No shell is used *by* this module: every subprocess takes an argv list, so nothing an
 operator writes in a compose file or an env var can become a command.
 """
 
-import json
 import os
 import signal
 import subprocess
@@ -41,6 +42,8 @@ from config import (
     ConfigError,
     DOCKER_BIN,
     DOCKERD_BIN,
+    RESOLV_CONF,
+    RUNTIME_PATH,
     SERVICE_JSON,
     STACK_DIR,
     load,
@@ -115,6 +118,13 @@ class Supervisor:
         self.stopping = False
         self._document: Optional[Dict[str, object]] = None
         self._expected_services = 0
+        # What the supervisor does now, for the health slot. One of: "starting",
+        # "dockerd", "loading-images", "validating", "compose-up", "running",
+        # "failed", "stopping".
+        self.phase = "starting"
+        # Set once the compose project is known; until then the health slot reports
+        # the phase only.
+        self._ps_provider = None
 
     # ------------------------------------------------------------------ environment
     def compose_env(self) -> Dict[str, str]:
@@ -132,6 +142,10 @@ class Supervisor:
         redirect the stack onto another daemon.
         """
         env = dict(os.environ)
+        # Set, not inherited: nodo's /init PATH does not contain /opt/docker/bin, and
+        # dockerd finds containerd, runc and docker-proxy through PATH. See
+        # config.RUNTIME_PATH.
+        env["PATH"] = RUNTIME_PATH
         env["DOCKER_HOST"] = f"unix://{self.socket_path()}"
         env["COMPOSE_PROJECT_NAME"] = self.config.project_name
         # Compose reads this to find the plugin when invoked as `docker compose`; set
@@ -148,6 +162,53 @@ class Supervisor:
         # /run is a tmpfs under nodo's initramfs, which is the right place for a socket
         # and the wrong place for image layers -- see config.DEFAULT_DATA_ROOT.
         return "/run/docker.sock"
+
+    # --------------------------------------------------------------------- resolver
+    def ensure_resolver(self, path: str = RESOLV_CONF) -> bool:
+        """Make sure `path` names a DNS server. Returns True if it wrote the file.
+
+        A nodo guest has no resolver of its own (see config.DEFAULT_DNS_SERVERS).
+        dockerd reads this file to look up registries, and passes the servers to the
+        containers of the stack. Without a `nameserver` line every image pull fails
+        with a lookup error.
+
+        The file is kept when it already names a server and the operator did not set
+        `DNS_SERVERS`. That is the case under `docker run`, where Docker mounts its
+        own resolv.conf. An explicit `DNS_SERVERS` always replaces the file.
+
+        A failure to write is logged and is not fatal: a stack with packed image tars
+        and no egress needs no resolver.
+        """
+        current = ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                current = handle.read()
+        except OSError:
+            current = ""
+
+        has_server = any(
+            line.split()[:1] == ["nameserver"] for line in current.splitlines()
+        )
+        if has_server and not self.config.dns_servers_explicit:
+            log(f"{path} already names a DNS server; kept as is")
+            return False
+
+        body = "# Written by compose-runner (service/supervisor.py).\n" + "".join(
+            f"nameserver {server}\n" for server in self.config.dns_servers
+        )
+        try:
+            # Written in place, not replaced by a rename: under `docker run` this file
+            # is a bind mount, and a rename over a mount point fails.
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+        except OSError as e:
+            log(
+                f"WARNING: cannot write {path}: {e}. Image pulls will fail if the stack "
+                "needs a registry."
+            )
+            return False
+        log(f"DNS servers in {path}: {', '.join(self.config.dns_servers)}")
+        return True
 
     # ---------------------------------------------------------------------- dockerd
     def dockerd_argv(self, storage_driver: str) -> List[str]:
@@ -413,6 +474,8 @@ class Supervisor:
         self._expected_services = len(names)
         log(f"compose file declares {len(names)} service(s): {', '.join(names)}")
 
+        compose_spec.refuse_reserved_ports(document, [self.config.health_port])
+
         declaration = self.read_service_json()
         api = declaration.get("api") or []
         if api:
@@ -503,9 +566,8 @@ class Supervisor:
     def install_signal_handlers(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, self._on_signal)
-        # SIGCHLD is explicitly *not* handled with a handler that reaps, because the
-        # subprocess module's own waiting would race with it. Reaping is done in the
-        # supervise loop instead -- see `reap`.
+        # SIGCHLD is not handled here. tini (PID 1) reaps the orphans, and the
+        # subprocess module waits for the children of this process.
 
     def _on_signal(self, signum: int, _frame: object) -> None:
         if self.stopping:
@@ -514,50 +576,53 @@ class Supervisor:
         self.stopping = True
         log(f"signal {signum}: shutting the stack down")
 
-    def reap(self) -> int:
-        """Reap any exited children this process did not explicitly wait for.
-
-        PID 1 with no init underneath it inherits every orphan in the VM, and dockerd's
-        tree makes plenty: `docker-proxy` per published port, `runc` per container
-        start, containerd-shim per container. Unreaped they accumulate as zombies for
-        the life of the instance, and a long-lived stack that restarts containers will
-        eventually exhaust the pid table.
-
-        `WNOHANG` so this never blocks the supervise loop, and ECHILD is the ordinary
-        "nothing to reap" answer rather than an error.
-        """
-        reaped = 0
-        while True:
-            try:
-                pid, _ = os.waitpid(-1, os.WNOHANG)
-            except ChildProcessError:
-                break
-            except OSError:
-                break
-            if pid == 0:
-                break
-            # A child the subprocess module is tracking (dockerd) may be reaped here
-            # first; Popen.poll() handles an already-reaped pid, so this is safe.
-            reaped += 1
-        return reaped
-
     # --------------------------------------------------------------------- lifecycle
+    def health_status(self) -> Tuple[int, Dict[str, object]]:
+        """The answer of the health slot: the phase, and the containers once known.
+
+        Before the compose project is validated there are no containers to ask about,
+        so the answer is 503 with the phase alone. That lets a caller tell "dockerd
+        is still starting" from "the stack is broken".
+        """
+        phase = self.phase
+        provider = self._ps_provider
+        if phase == "failed":
+            return 503, {"status": "failed", "phase": phase}
+        if provider is None or phase in ("starting", "dockerd", "loading-images", "validating"):
+            return 503, {"status": "starting", "phase": phase}
+        code, document = provider()
+        document = dict(document)
+        document["phase"] = phase
+        if phase != "running" and code == 200:
+            # compose may list every container as up before `up --wait` returns.
+            # The stack is not ready until the supervisor says so.
+            code = 503
+            document["status"] = "starting"
+        return code, document
+
     def start_health(self) -> None:
-        provider = health.compose_ps_provider(
-            self.compose_argv("ps", "--all", "--format", "json"),
-            expected=self._expected_services,
-        )
-        # Started *before* dockerd and the stack in `run()`, so a caller polling it
-        # during a slow launch gets an honest 503 rather than a refused connection.
-        # That is the whole reason this slot exists.
-        self.health_server = health.serve(self.config.health_port, provider)
+        """Start the health slot. Called first in `run()`, before dockerd.
+
+        So a caller that polls it during a slow launch gets an honest 503 with the
+        phase, and not a refused connection. That is the reason the slot exists.
+        """
+        self.health_server = health.serve(self.config.health_port, self.health_status)
         log(f"health slot listening on :{self.config.health_port}/health")
+
+    def enable_container_health(self) -> None:
+        """Let the health slot report `docker compose ps`, once the project is known."""
+        self._ps_provider = health.cached(
+            health.compose_ps_provider(
+                self.compose_argv("ps", "--all", "--format", "json"),
+                expected=self._expected_services,
+                env=self.compose_env(),
+            )
+        )
 
     def supervise(self) -> int:
         """Block until a signal or until the stack stops being up. Returns an exit code."""
         log("supervising; SIGTERM will bring the stack down")
         while not self.stopping:
-            self.reap()
             if self.dockerd is not None and self.dockerd.poll() is not None:
                 log(
                     f"FATAL: dockerd exited with status {self.dockerd.returncode} while "
@@ -566,8 +631,8 @@ class Supervisor:
                 return 1
             # Sliced sleep so a signal is acted on promptly rather than up to a whole
             # interval later. signal delivery interrupts sleep, but only the current
-            # slice, and a 15 s pause before teardown would be a 15 s pause the node
-            # sees as an instance ignoring SIGTERM.
+            # slice, and a 15 s pause before teardown would be a 15 s pause that
+            # `docker stop` sees as a process ignoring SIGTERM.
             for _ in range(int(SUPERVISE_INTERVAL_S / POLL_INTERVAL_S)):
                 if self.stopping:
                     break
@@ -582,14 +647,26 @@ class Supervisor:
         log(f"storage driver: {self.config.storage_driver}")
 
         try:
+            self.start_health()
+        except OSError as e:
+            log(f"FATAL: cannot listen on the health port {self.config.health_port}: {e}")
+            return 1
+
+        try:
+            self.ensure_resolver()
+            self.phase = "dockerd"
             self.start_dockerd()
+            self.phase = "loading-images"
             loaded = self.load_offline_images()
             if loaded:
                 log(f"loaded {loaded} packed image archive(s)")
+            self.phase = "validating"
             self.validate()
-            self.start_health()
+            self.enable_container_health()
+            self.phase = "compose-up"
             self.compose_up()
         except (StackError, compose_spec.ComposeSpecError) as e:
+            self.phase = "failed"
             log(f"FATAL: {e}")
             # Best-effort teardown of whatever did start, so a failed launch does not
             # leave containers running in a VM whose supervisor has given up.
@@ -598,12 +675,14 @@ class Supervisor:
             self.stop_dockerd()
             return 1
 
+        self.phase = "running"
         code = self.supervise()
+        self.phase = "stopping"
         down = self.compose_down()
         self.stop_dockerd()
         # A clean `down` after a clean shutdown is a clean exit. A failed `down` is
         # reported in the status, because a stack that would not stop is a thing the
-        # node should hear about rather than a warning in a log nobody reads.
+        # caller should hear about rather than a warning in a log nobody reads.
         return code or (0 if down == 0 else 1)
 
 

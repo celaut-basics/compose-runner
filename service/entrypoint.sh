@@ -1,5 +1,5 @@
 #!/bin/sh
-# What runs as PID 1, and the three things it does before handing over to Python.
+# What runs first as PID 1, and the things it does before it starts the supervisor.
 #
 # Under nodo's microVM virtualizer this process is execed by the initramfs `/init`
 # straight out of `switch_root` (`bash/build_ch_initramfs.sh`), as root, with no init
@@ -22,6 +22,13 @@
 
 set -eu
 
+# Set here, not in the Dockerfile. nodo applies no `ENV` line of the image: the
+# packer exports a filesystem only, and the guest /init starts this script with its
+# own PATH, which does not contain /opt/docker/bin. dockerd finds containerd, runc and
+# docker-proxy through PATH. Keep this value equal to config.RUNTIME_PATH.
+PATH=/usr/local/sbin:/opt/docker/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
 log() {
     printf '[compose-runner] %s\n' "$1" >&2
 }
@@ -39,6 +46,7 @@ fatal() {
 # built.
 [ -x /opt/docker/bin/dockerd ] || fatal "/opt/docker/bin/dockerd is missing or not executable"
 [ -x /opt/docker/bin/docker ] || fatal "/opt/docker/bin/docker is missing or not executable"
+[ -x /opt/docker/bin/docker-init ] || fatal "/opt/docker/bin/docker-init is missing or not executable"
 [ -x /usr/local/lib/docker/cli-plugins/docker-compose ] \
     || fatal "the docker compose plugin is missing from /usr/local/lib/docker/cli-plugins, which is where the Docker CLI looks for it"
 [ -x /usr/bin/python3 ] || fatal "/usr/bin/python3 is missing"
@@ -127,9 +135,16 @@ done
 log "iptables backend: $IPTABLES_BACKEND ($(/usr/local/sbin/iptables --version 2>/dev/null || echo 'not usable'))"
 
 # ------------------------------------------------------------------------- 5. hand over
-# `exec`, so the Python supervisor *becomes* PID 1 rather than being a child of this
-# shell. That matters twice: a signal the node sends reaches the thing that knows how to
-# run `docker compose down`, and the reaping that PID 1 owes its orphans happens in the
-# process that has a loop to do it in (see service/supervisor.py, `reap`).
-log "handing over to the supervisor"
-exec /usr/bin/python3 /service/supervisor.py
+# `exec` docker-init (tini, from the Docker static bundle), and tini starts the Python
+# supervisor as its child. tini as PID 1 does two things:
+#
+# * it reaps every orphan in the guest (docker-proxy, runc, the shims). A reap loop in
+#   the supervisor would also take the exit status of its own subprocesses, for
+#   example the `docker compose ps` that the health thread runs;
+# * it forwards SIGTERM and SIGINT to the supervisor, which turns them into
+#   `docker compose down`. Under nodo no signal arrives: `nodo kill` stops the whole
+#   VM. Under `docker stop` the signal does arrive.
+#
+# tini exits with the status of the supervisor, so a fatal error still ends PID 1.
+log "handing over to the supervisor (under docker-init)"
+exec /opt/docker/bin/docker-init -- /usr/bin/python3 /service/supervisor.py
