@@ -333,7 +333,7 @@ CVE-2024-3094).
 
 ```sh
 sh tests/run.sh          # 250 offline tests, about 6 s, no Docker
-sh tests/test_image.sh   # 41 checks on a built image; needs --privileged and the network
+sh tests/test_image.sh   # 40 checks on a built image; needs --privileged and the network
 ```
 
 The offline suite needs **Python 3 and nothing else**: no pytest, no venv, no
