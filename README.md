@@ -5,7 +5,7 @@ A [Celaut](https://github.com/celaut-project/nodo) service that runs an existing
 
 ## Why this exists
 
-A Celaut service is one microVM, built from one `.service/Dockerfile`. Most real
+A Celaut service is one microVM, built from one Dockerfile. Most real
 applications are a `docker-compose.yml` with two or three services: an app and a
 database, or a worker and a queue. Without this service, the only way onto a nodo is
 to merge that stack into a single Dockerfile by hand, and to do it again each time
@@ -21,7 +21,7 @@ its Dockerfiles.
 The service runs Docker (Docker-in-Docker) inside its own microVM. At start, it runs
 `docker compose up` on a compose file that is packed with the service. The internal
 compose network stays internal. The ports that callers must reach are published by the
-compose file and declared as API slots in `.service/service.json`.
+compose file and declared as API slots in `<arch>/.service/service.json`.
 
 This costs more than a native single-container service: a container runtime runs
 inside the sandbox. That is the price of a compose app with no rewrite. If you run a
@@ -47,8 +47,8 @@ The parts:
 - `service/health.py` is the `GET /health` slot. It reports the phase of the launch
   and `docker compose ps`.
 - `service/config.py` is the environment contract.
-- `.service/preflight.py` does the same cross-check at **build** time, so a mismatch
-  fails `nodo pack` and not a node.
+- `build/preflight.py` (linked into each `<arch>/.service/`) does the same cross-check
+  at **build** time, so a mismatch fails `nodo pack` and not a node.
 - `stack/` is an example stack (an HTTP service and redis). The tests use it. An
   operator replaces it.
 
@@ -86,11 +86,12 @@ You need a nodo with a packer backend (see `docs/skill/SKILL.md` and
    cp /path/to/your/docker-compose.yml stack/
    ```
 
-3. Edit `.service/service.json`:
+3. Pick the pack root of the node's architecture: `amd64/` (`linux/amd64`) or
+   `arm64/` (`linux/arm64`). Each has its own `.service/` and links to the shared
+   `service/` and `stack/` (see [Pack roots](#pack-roots-one-tree-per-architecture)).
+   Edit `<arch>/.service/service.json` (both, if you pack both):
    - Make `api` list each port that callers must reach. Each one must be published by
      the compose file. Keep the health slot (9000).
-   - Set `architecture` to the architecture of the host that packs and runs it
-     (`linux/arm64` or `linux/amd64`). The Dockerfile has pinned checksums for both.
      **On an x86_64 node, the current guest kernel cannot start a container that is
      not privileged** ([finding 8](NODE-REQUIREMENTS.md)).
    - Add to `envs` each variable of your stack that you want to set at launch. nodo
@@ -102,7 +103,7 @@ You need a nodo with a packer backend (see `docs/skill/SKILL.md` and
 4. Pack it. The command prints the service id (a content hash):
 
    ```sh
-   nodo pack .
+   nodo pack amd64          # or: nodo pack arm64
    ```
 
 5. Check that the node can run it, then start it:
@@ -135,10 +136,34 @@ The service id identifies **your stack**: the compose file and all files in `sta
 are hashed into it. Two operators who pack two different compose files get two
 different services. That is the purpose of the template shape.
 
+### Pack roots: one tree per architecture
+
+As in `celaut-basics/demo-service`, each architecture has its own pack root:
+
+```
+amd64/  arm64/              pack roots
+├── .service/               Dockerfile, service.json, pack_config.json (one set per arch)
+│   └── preflight.py  -> ../../build/preflight.py
+├── service  -> ../service
+├── stack    -> ../stack
+└── .dockerignore -> ../.dockerignore
+service/  stack/  build/    shared source
+```
+
+`nodo pack <dir>` reads only `<dir>/.service/` and copies `<dir>` to its cache. The
+copy follows symlinks, so the shared files reach each pack root. The two Dockerfiles
+differ only in their first comment: the base image pin is a multi-arch index, and the
+fetch stage picks the Docker and compose tarballs for `TARGETARCH`, which BuildKit
+sets from `architecture`. `tests/test_layout.py` checks the shape. To pack the
+architecture that is not the host's, the packer host needs a binfmt_misc handler.
+
 ### Run it locally, without a node
 
 ```sh
-docker buildx build --platform linux/arm64 -f .service/Dockerfile -t compose-runner:test --load .
+# docker does not follow a link out of the build context (nodo's copy does), so
+# build from a copy of the pack root with its links resolved.
+rm -rf /tmp/cr && cp -RL arm64 /tmp/cr
+docker buildx build --platform linux/arm64 -f /tmp/cr/.service/Dockerfile -t compose-runner:test --load /tmp/cr
 
 # --privileged is necessary: dockerd must create bridges, write iptables rules and
 # mount overlays. The Dockerfile sets no ENTRYPOINT, because nodo reads it from
@@ -147,14 +172,14 @@ docker run -d --privileged -p 8080:8080 -p 9000:9000 \
     --entrypoint /service/entrypoint.sh compose-runner:test
 ```
 
-On an x86_64 host, use `--platform linux/amd64`.
+On an x86_64 host, copy `amd64` and use `--platform linux/amd64`.
 
 ### Ports and slots
 
 | | |
 |---|---|
 | a port in the compose file's **`ports:`** | binds on the interface of the microVM |
-| an entry in **`api`** in `.service/service.json` | what the node advertises and forwards to that interface |
+| an entry in **`api`** in `<arch>/.service/service.json` | what the node advertises and forwards to that interface |
 
 The two must agree, and **only this service checks that**. The node never reads the
 compose file, and compose never reads `service.json`. A slot at 8080 for a stack that
@@ -163,7 +188,7 @@ refuses every connection.
 
 So the service checks it twice:
 
-- at **build** time (`.service/preflight.py`, the last `RUN` in the Dockerfile). A
+- at **build** time (`build/preflight.py`, the last `RUN` in the Dockerfile). A
   mismatch fails `nodo pack` before a service id exists.
 - at **start** (`service/compose_spec.py`), against `docker compose config --format
   json`. That is compose's own normalisation, so `${VAR}` interpolation and short
@@ -307,7 +332,7 @@ arm64). Most of it is the Docker binaries: `dockerd` 95 MB, the CLI 42 MB,
 of your stack**, which are written to this disk. One application image is often
 200 MB to 1.5 GB. On `vfs` a stack costs several times more, because vfs copies each
 layer. Packed image tars cost about twice their size (the tar and the loaded layers).
-For a stack of large images, raise `at_init.disk_space` in `.service/service.json`.
+For a stack of large images, raise `at_init.disk_space` in `<arch>/.service/service.json`.
 
 ## Everything is pinned
 
