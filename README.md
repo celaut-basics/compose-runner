@@ -63,9 +63,11 @@ resolving its configuration for both architectures:
   container. The supervisor detects this and starts dockerd with
   `DOCKER_INSECURE_NO_IPTABLES_RAW=1`.
 - No `bpf(2)` on **x86_64**. On cgroup v2, runc then refuses each container that is
-  not privileged. The service cannot fix this; it logs a warning. Until the nodo guest
-  kernel has `CONFIG_BPF_SYSCALL`, use an arm64 node, or a stack of privileged
-  containers.
+  not privileged. The entrypoint detects this and mounts cgroup v1 in place of v2, so
+  runc uses the v1 devices controller. v1 has no memory controller in this kernel, so
+  the memory limits of the stack's containers are not enforced (the microVM limit
+  is). Until the nodo guest kernel has `CONFIG_BPF_SYSCALL`, that is the cost of
+  amd64.
 
 ## Use it with your own stack
 
@@ -92,8 +94,8 @@ You need a nodo with a packer backend (see `docs/skill/SKILL.md` and
    Edit `<arch>/.service/service.json` (both, if you pack both):
    - Make `api` list each port that callers must reach. Each one must be published by
      the compose file. Keep the health slot (9000).
-     **On an x86_64 node, the current guest kernel cannot start a container that is
-     not privileged** ([finding 8](NODE-REQUIREMENTS.md)).
+   - On an x86_64 node, the containers of the stack get no memory limit (cgroup v1
+     with no memory controller, [finding 8](NODE-REQUIREMENTS.md)).
    - Add to `envs` each variable of your stack that you want to set at launch. nodo
      does not enforce this list: `nodo execute -e` gives any variable. The list tells
      the reader of `service.json` which names the service reads.

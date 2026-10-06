@@ -41,8 +41,9 @@ depends on the compiler.
 
 **KVM, and a guest kernel built from this checkout's fragment.** Nothing else — no
 device node, no module, no native application. The kernel features are all present
-except the ones in findings 1 and 8. On an **x86_64** node, finding 8 is a blocker:
-each container that is not privileged fails to start.
+except the ones in findings 1 and 8. On an **x86_64** node, finding 8 would stop each
+container that is not privileged; the entrypoint works around it with cgroup v1, with
+no memory limits for the containers (finding 8 b).
 
 **Not a GPU.** `celaut.Sysresources` has `mem_limit`, `disk_space`, `cpu_period`,
 `cpu_quota` and `blkio_weight` and no accelerator field, so a stack needing one could
@@ -438,12 +439,16 @@ loaded, runc refuses the container unless every rule allows everything
 container has deny rules. So on an x86_64 node, each container that is not
 `privileged: true` fails to start.
 
-There is no fix inside the service. The cgroup v1 devices controller needs no eBPF, but
-a remount to cgroup v1 is not a fix either: the guest has no `CONFIG_MEMCG_V1`, so v1
-has no memory controller. **What this service does:** the supervisor logs a warning
-before dockerd starts, when cgroup v2 is mounted and
-`/proc/sys/kernel/unprivileged_bpf_disabled` is missing (that sysctl exists only with
-`CONFIG_BPF_SYSCALL`). Then the runc error that follows has its cause next to it.
+**What this service does** (since 2026-10-06): `service/entrypoint.sh` step 3b. When
+cgroup v2 is mounted and `/proc/sys/kernel/unprivileged_bpf_disabled` is missing (that
+sysctl exists only with `CONFIG_BPF_SYSCALL`), it unmounts cgroup v2 and mounts one
+cgroup v1 hierarchy for each controller that the kernel can mount on v1. The v1
+devices controller needs no eBPF, so runc applies the device rules there. The guest has
+no `CONFIG_MEMCG_V1`, so v1 has no memory controller: the memory limits of the stack's
+containers are not enforced, and the entrypoint logs a warning. The microVM keeps its
+own memory limit. If the devices controller cannot be mounted on v1, the entrypoint
+mounts cgroup v2 again and logs a warning. The supervisor still logs its warning if
+cgroup v2 stays mounted with no bpf(2).
 
 **What nodo could do about it:** add `CONFIG_BPF_SYSCALL=y`, `CONFIG_CGROUP_BPF=y` and
 `CONFIG_IP_NF_RAW=y` to `bash/guest-kernel/nodo-guest.config`, in the block that says
@@ -451,9 +456,12 @@ before dockerd starts, when cgroup v2 is mounted and
 `assert_config` loop of `bash/guest-kernel/build.sh`. That loop does not check
 `CONFIG_NFT_NAT` either (finding 1).
 
-**Not verified:** no guest booted. The evidence is the resolved `.config` and the moby
-and runc source. A boot of the x86_64 guest kernel with this stack is the test that
-confirms it.
+**Verified on a real node** (nodo `dev` `f14a1447`, x86_64 with KVM, 2026-10-06): the
+pinned x86_64 guest kernel (6.12.103) has no `unprivileged_bpf_disabled` string in its
+decompressed image; the arm64 one has it. With step 3b, the `linux/amd64` tree booted,
+mounted v1 for `devices cpu cpuacct pids freezer blkio net_cls perf_event hugetlb` (no
+`memory`, no `cpuset`), and brought the example stack up (two unprivileged containers,
+images pulled from Docker Hub) in 98 s.
 
 ## Also re-checked: how an instance stops
 
