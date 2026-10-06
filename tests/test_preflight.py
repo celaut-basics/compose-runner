@@ -1,6 +1,6 @@
 """The build-time reader, whose contract is "be right or admit you skipped it".
 
-`.service/preflight.py` parses a compose file with a deliberately tiny YAML subset,
+`build/preflight.py` (linked as `<arch>/.service/preflight.py`) parses a compose file with a deliberately tiny YAML subset,
 because PyYAML is not in the image and `docker compose config` cannot be used in a build
 step (it would either substitute the build's environment for `${VAR}` or refuse).
 
@@ -229,11 +229,12 @@ class Main(unittest.TestCase):
         return path
 
     def test_the_repos_real_files_pass(self):
-        code = preflight.main([
-            os.path.join(ROOT, "stack", "docker-compose.yml"),
-            os.path.join(ROOT, ".service", "service.json"),
-        ])
-        self.assertEqual(0, code)
+        for arch in ("amd64", "arm64"):
+            code = preflight.main([
+                os.path.join(ROOT, "stack", "docker-compose.yml"),
+                os.path.join(ROOT, arch, ".service", "service.json"),
+            ])
+            self.assertEqual(0, code, arch)
 
     def test_a_slot_the_stack_does_not_publish_fails_the_build(self):
         compose = self.write("c.yml", 'services:\n  w:\n    ports:\n      - "8080:80"\n')

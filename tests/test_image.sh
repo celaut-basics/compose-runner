@@ -6,8 +6,11 @@
 #
 #     sh tests/test_image.sh
 #
-# Build the image first (use linux/amd64 and PLATFORM=linux/amd64 on an x86_64 host):
-#     docker buildx build --platform linux/arm64 -f .service/Dockerfile -t compose-runner:test --load .
+# Build the image first, from a copy of the pack root with its links resolved (docker
+# does not follow a link out of the build context; nodo's copy does). Use amd64 and
+# PLATFORM=linux/amd64 on an x86_64 host:
+#     rm -rf /tmp/cr && cp -RL arm64 /tmp/cr
+#     docker buildx build --platform linux/arm64 -f /tmp/cr/.service/Dockerfile -t compose-runner:test --load /tmp/cr
 #
 # **`--privileged` is required and is not a test shortcut.** dockerd has to create a
 # bridge, write iptables rules, mount overlays and clone namespaces; an unprivileged

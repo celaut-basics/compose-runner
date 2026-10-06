@@ -330,7 +330,7 @@ class TheRealFilesAgree(unittest.TestCase):
         import os
 
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(root, ".service", "service.json"), encoding="utf-8") as handle:
+        with open(os.path.join(root, "amd64", ".service", "service.json"), encoding="utf-8") as handle:
             declaration = json.load(handle)
 
         # The compose file is read through the build-time reader rather than compose
@@ -338,7 +338,7 @@ class TheRealFilesAgree(unittest.TestCase):
         # same check through `docker compose config` where a daemon exists.
         import sys
 
-        sys.path.insert(0, os.path.join(root, ".service"))
+        sys.path.insert(0, os.path.join(root, "build"))
         import preflight
 
         with open(os.path.join(root, "stack", "docker-compose.yml"), encoding="utf-8") as handle:

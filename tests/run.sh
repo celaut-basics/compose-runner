@@ -15,16 +15,16 @@ set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
-# `service/` and `.service/` on the path, because that is where the modules live in the
+# `service/` and `build/` on the path, because that is where the modules live in the
 # image too -- `/service/supervisor.py` imports `config`, not `service.config`, and a
 # test layout that needed a package would be testing a different import graph than the
-# one that ships. `.service/` is there for `preflight.py`, which runs during the build.
-PYTHONPATH="$ROOT/service:$ROOT/.service" export PYTHONPATH
+# one that ships. `build/` is there for `preflight.py`, which runs during the build.
+PYTHONPATH="$ROOT/service:$ROOT/build" export PYTHONPATH
 
 PYTHON=${PYTHON:-python3}
 
 echo "# python:  $($PYTHON --version 2>&1)"
-echo "# modules: $ROOT/service, $ROOT/.service"
+echo "# modules: $ROOT/service, $ROOT/build"
 echo
 
 cd "$ROOT/tests"

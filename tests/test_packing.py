@@ -4,7 +4,7 @@
 `prepare_directory` and `generate_service_zip` (nodo
 `src/commands/packer/zip_with_dockerfile/`):
 
-1. every `COPY ./x` in `.service/Dockerfile` becomes `COPY service/x`
+1. every `COPY ./x` in `<arch>/.service/Dockerfile` becomes `COPY service/x`
    (`--from=` lines are not changed);
 2. the build context is `.service/`, and `.service/service/` holds only the items
    that `include` in `pack_config.json` lists;
@@ -31,7 +31,13 @@ import unittest
 import config
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVICE_DIR = os.path.join(ROOT, ".service")
+# One pack root per architecture (`nodo pack amd64` / `nodo pack arm64`). Each holds
+# its own `.service/` and links to the shared sources (see test_layout.py).
+ARCHES = ("amd64", "arm64")
+
+
+def _service_dir(arch):
+    return os.path.join(ROOT, arch, ".service")
 
 
 def _read(path):
@@ -39,10 +45,10 @@ def _read(path):
         return handle.read()
 
 
-def _dockerfile_lines():
+def _dockerfile_lines(arch):
     """The Dockerfile as logical lines: continuations joined, comments removed."""
     logical, current = [], ""
-    for raw in _read(os.path.join(SERVICE_DIR, "Dockerfile")).splitlines():
+    for raw in _read(os.path.join(_service_dir(arch), "Dockerfile")).splitlines():
         if not current and raw.lstrip().startswith("#"):
             continue
         if raw.rstrip().endswith("\\"):
@@ -71,14 +77,19 @@ def _rewrite_copy(line):
     return " ".join(parts)
 
 
-def _build_context(destination):
-    """The `.service/` build context that nodo's packer makes from this repo."""
+def _build_context(destination, arch):
+    """The `.service/` build context that nodo's packer makes from the `arch` pack root.
+
+    nodo copies the pack root and follows symlinks, so do the copies here.
+    """
+    pack_root = os.path.join(ROOT, arch)
+    service_dir = _service_dir(arch)
     context = os.path.join(destination, ".service")
-    shutil.copytree(SERVICE_DIR, context)
-    pack_config = json.loads(_read(os.path.join(SERVICE_DIR, "pack_config.json")))
+    shutil.copytree(service_dir, context)
+    pack_config = json.loads(_read(os.path.join(service_dir, "pack_config.json")))
 
     ignore = list(pack_config.get("ignore", []))
-    for candidate in (os.path.join(SERVICE_DIR, ".dockerignore"), os.path.join(ROOT, ".dockerignore")):
+    for candidate in (os.path.join(service_dir, ".dockerignore"), os.path.join(pack_root, ".dockerignore")):
         if os.path.exists(candidate):
             ignore.extend(_read(candidate).splitlines())
             break
@@ -86,7 +97,7 @@ def _build_context(destination):
     source = os.path.join(context, "service")
     os.makedirs(source)
     for item in pack_config["include"]:
-        src = os.path.join(ROOT, item)
+        src = os.path.join(pack_root, item)
         dest = os.path.join(source, item)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         if os.path.isdir(src):
@@ -111,14 +122,19 @@ def _build_context(destination):
 
 class CopySources(unittest.TestCase):
     def test_every_copy_source_exists_in_the_context_nodo_builds(self):
+        for arch in ARCHES:
+            with self.subTest(arch=arch):
+                self._check_copy_sources(arch)
+
+    def _check_copy_sources(self, arch):
         copies = [
             _rewrite_copy(line)
-            for line in _dockerfile_lines()
+            for line in _dockerfile_lines(arch)
             if line.startswith("COPY ") and "--from=" not in line
         ]
         self.assertTrue(copies, "the Dockerfile has no COPY from the context")
         with tempfile.TemporaryDirectory() as directory:
-            context = _build_context(directory)
+            context = _build_context(directory, arch)
             for line in copies:
                 for source in line.split()[1:-1]:
                     if source.startswith("--"):
@@ -133,7 +149,7 @@ class CopySources(unittest.TestCase):
     def test_every_copy_source_is_written_with_a_dot_prefix(self):
         # PACKING.md: a bare relative origin (`COPY src /app`) is not rewritten, and it
         # then reads the `.service/` context, not the project.
-        for line in _dockerfile_lines():
+        for line in (l for arch in ARCHES for l in _dockerfile_lines(arch)):
             if line.startswith("COPY ") and "--from=" not in line:
                 with self.subTest(copy=line):
                     for source in line.split()[1:-1]:
@@ -143,8 +159,11 @@ class CopySources(unittest.TestCase):
     def test_the_ignore_patterns_keep_the_files_the_image_needs(self):
         # nodo applies `ignore` and `.dockerignore` recursively, so a pattern such as
         # `*.md` or `tests/` also removes files inside an operator's build contexts.
-        with tempfile.TemporaryDirectory() as directory:
-            context = _build_context(directory)
+        for arch in ARCHES:
+            with tempfile.TemporaryDirectory() as directory:
+                self._check_kept(_build_context(directory, arch))
+
+    def _check_kept(self, context):
             for path in (
                 "service/service/entrypoint.sh",
                 "service/service/supervisor.py",
@@ -158,8 +177,10 @@ class CopySources(unittest.TestCase):
     def test_no_ignore_pattern_is_one_that_rglob_cannot_take(self):
         # pathlib refuses an absolute pattern ("/tests"), and the pack would stop
         # with NotImplementedError.
-        pack_config = json.loads(_read(os.path.join(SERVICE_DIR, "pack_config.json")))
-        patterns = list(pack_config.get("ignore", []))
+        patterns = []
+        for arch in ARCHES:
+            pack_config = json.loads(_read(os.path.join(_service_dir(arch), "pack_config.json")))
+            patterns += pack_config.get("ignore", [])
         patterns += _read(os.path.join(ROOT, ".dockerignore")).splitlines()
         for pattern in patterns:
             self.assertFalse(pattern.strip().startswith("/"), pattern)
@@ -168,11 +189,14 @@ class CopySources(unittest.TestCase):
 class DockerfileRules(unittest.TestCase):
     def test_no_entrypoint_and_no_cmd(self):
         # nodo ignores both; init.entry_path in service.json is what runs.
-        for line in _dockerfile_lines():
+        for line in (l for arch in ARCHES for l in _dockerfile_lines(arch)):
             self.assertFalse(re.match(r"^(ENTRYPOINT|CMD)\b", line), line)
 
     def test_both_architectures_have_pinned_checksums(self):
-        text = _read(os.path.join(SERVICE_DIR, "Dockerfile"))
+        for arch in ARCHES:
+            self._check_checksums(_read(os.path.join(_service_dir(arch), "Dockerfile")))
+
+    def _check_checksums(self, text):
         for name in (
             "DOCKER_SHA256_ARM64",
             "DOCKER_SHA256_AMD64",
@@ -182,17 +206,17 @@ class DockerfileRules(unittest.TestCase):
             with self.subTest(arg=name):
                 self.assertRegex(text, rf"ARG {name}=[0-9a-f]{{64}}\n")
 
-    def test_the_architecture_is_one_the_dockerfile_can_build(self):
-        declaration = json.loads(_read(os.path.join(SERVICE_DIR, "service.json")))
-        self.assertIn(declaration["architecture"], ("linux/arm64", "linux/amd64"))
+    def test_each_tree_declares_its_own_architecture(self):
+        for arch in ARCHES:
+            declaration = json.loads(_read(os.path.join(_service_dir(arch), "service.json")))
+            self.assertEqual(f"linux/{arch}", declaration["architecture"])
 
 
 class EntryPath(unittest.TestCase):
-    def setUp(self):
-        self.declaration = json.loads(_read(os.path.join(SERVICE_DIR, "service.json")))
-
     def test_the_entry_path_is_the_entrypoint_script(self):
-        self.assertEqual(["service", "entrypoint.sh"], self.declaration["init"]["entry_path"])
+        for arch in ARCHES:
+            declaration = json.loads(_read(os.path.join(_service_dir(arch), "service.json")))
+            self.assertEqual(["service", "entrypoint.sh"], declaration["init"]["entry_path"])
 
     def test_the_entrypoint_is_executable_in_the_repo(self):
         # The packer keeps the mode bits, and the Dockerfile also sets 0755.
@@ -230,10 +254,11 @@ class Resources(unittest.TestCase):
     def test_at_most_disk_is_not_above_at_init_disk(self):
         # The rootfs is sized once, from at_init.disk_space. A larger at_most figure
         # grows nothing and only raises the admission quote.
-        resources = json.loads(_read(os.path.join(SERVICE_DIR, "service.json")))["resources"]
-        self.assertLessEqual(
-            resources["at_most"]["disk_space"], resources["at_init"]["disk_space"]
-        )
+        for arch in ARCHES:
+            resources = json.loads(_read(os.path.join(_service_dir(arch), "service.json")))["resources"]
+            self.assertLessEqual(
+                resources["at_most"]["disk_space"], resources["at_init"]["disk_space"]
+            )
 
 
 if __name__ == "__main__":

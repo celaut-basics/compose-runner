@@ -238,10 +238,10 @@ class HealthPort(unittest.TestCase):
         import sys
 
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        sys.path.insert(0, os.path.join(root, ".service"))
+        sys.path.insert(0, os.path.join(root, "build"))
         import preflight
 
-        with open(os.path.join(root, ".service", "service.json"), encoding="utf-8") as handle:
+        with open(os.path.join(root, "amd64", ".service", "service.json"), encoding="utf-8") as handle:
             declaration = json.load(handle)
 
         self.assertEqual(config.DEFAULT_HEALTH_PORT, preflight.health_port(declaration))
@@ -261,7 +261,7 @@ class TheDeclarationListsEveryVariable(unittest.TestCase):
         import os
 
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(root, ".service", "service.json"), encoding="utf-8") as handle:
+        with open(os.path.join(root, "amd64", ".service", "service.json"), encoding="utf-8") as handle:
             declared = set(json.load(handle)["envs"])
 
         read_by_config = {

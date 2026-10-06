@@ -1,3 +1,8 @@
+# linux/arm64 variant. nodo builds it with --opt platform=linux/arm64 (from
+# service.json), and BuildKit sets TARGETARCH from it. The amd64/ and arm64/
+# Dockerfiles differ only in this comment: the base pin is a multi-arch index,
+# and the fetch stage picks the Docker and compose tarball for TARGETARCH.
+
 # Every dependency is pinned by digest or by SHA-256, with no `latest` anywhere and no
 # package pinned only to its suite. This service is content-addressed -- two packs of
 # the same source tree have to produce the same id -- and what this one packs is a
@@ -14,8 +19,8 @@
 # resolved to -- the same digest `celaut-basics/ergo-node` and
 # `celaut-basics/yt-transcript` pin. Its linux/arm64 member is
 # sha256:6bd27d44e6c32a66bbd72d7cb2b76a8ae3497ec2e5274a81abd1b37f6013fa1f; pinning the
-# index rather than that member is what lets `architecture` in service.json be a
-# one-line change instead of a second digest to look up.
+# index rather than that member is what lets the amd64/ and arm64/ trees share one
+# pin instead of a second digest to look up.
 ARG BASE_DIGEST=sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 # ------------------------------------------------------------------------ fetch stage
