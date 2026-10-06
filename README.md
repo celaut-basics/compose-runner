@@ -430,15 +430,26 @@ Docker 29 in the VM) and ran it:
 - The SHA-256 of the four pinned downloads (Docker 29.8.1 and compose v5.5.1, `aarch64`
   and `x86_64`) were compared with the published artifacts. All four agree.
 
+A run on a real node (nodo `dev` `1c9ac612`, x86_64 host with KVM, so the
+`linux/arm64` guest ran under QEMU TCG):
+
+- `nodo pack .` passed. `nodo execute` booted the guest. The legacy iptables backend,
+  the `raw` table switch of finding 8 and the health slot worked in the booted guest.
+- dockerd did not start until the supervisor started containerd itself (see the bug
+  list above).
+- Under TCG, dockerd needed about 95 s to start, and the stack needed 124 s. Use
+  `-e DOCKERD_TIMEOUT_S 600 -e COMPOSE_UP_TIMEOUT_S 1800` on such a node.
+- Under TCG, the pulls from Docker Hub failed with `TLS handshake timeout`. This is a
+  fixed 10 s limit in the Go HTTP client. With the two images in `stack/images/*.tar`
+  (a local test copy, with tags in place of the digests), the images loaded, both
+  containers ran, `GET /health` gave 200, and `GET :8080/` returned the whoami answer
+  through the slot. Port 6379 refused the connection.
+
 **Not verified:**
 
-- **This has never run under a real nodo.** It has not been through `nodo pack`, the
-  firewall, or a microVM. The guest-kernel findings in
-  [`NODE-REQUIREMENTS.md`](NODE-REQUIREMENTS.md) come from Kconfig, not from a booted
-  guest. The `raw` table switch and the `bpf(2)` warning of finding 8 could not be
-  tested, because the kernel of the test host has both.
-- amd64 (no image was built), the `stack/images/*.tar` path with a real tar, stacks
-  with `build:` contexts, and long runs.
+- Image pulls from a registry on a node that runs the guest at native speed (an arm64
+  node with KVM).
+- amd64 (no image was built), stacks with `build:` contexts, and long runs.
 
 ## What is deliberately not here
 
