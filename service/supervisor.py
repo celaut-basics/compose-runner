@@ -302,6 +302,9 @@ class Supervisor:
         `canSkipEBPFError`). The nodo x86_64 guest kernel has no CONFIG_BPF_SYSCALL.
         The arm64 guest kernel has it. NODE-REQUIREMENTS.md, finding 8.
 
+        entrypoint.sh (step 3b) replaces cgroup v2 with v1 on such a kernel, so this
+        warning shows only when that did not work.
+
         Not fatal: a stack of privileged containers still starts, and the check
         reads a proxy for the kernel option, not the option itself. The warning is
         there so the runc error that follows has a cause next to it.
