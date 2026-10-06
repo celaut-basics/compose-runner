@@ -19,6 +19,7 @@ from typing import Dict, Optional, Tuple
 # run a compose file this service id does not contain.
 DOCKER_BIN = "/opt/docker/bin/docker"
 DOCKERD_BIN = "/opt/docker/bin/dockerd"
+CONTAINERD_BIN = "/opt/docker/bin/containerd"
 # Where the Docker CLI finds the compose plugin. `/usr/local/lib/docker/cli-plugins` is
 # one of the directories it searches; /opt/docker/cli-plugins is not, and putting it
 # there produced a `docker compose` that did not exist as a subcommand at all -- see the

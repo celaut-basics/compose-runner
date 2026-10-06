@@ -39,9 +39,9 @@ The parts:
   run as non-root (with the reason), sets `PATH`, reports the cgroup version, selects
   the `iptables` backend, and starts the supervisor under `docker-init` (tini).
 - `service/supervisor.py` starts the health slot, writes a resolver file if the guest
-  has none, starts `dockerd` (`overlay2`, else `vfs`), runs `docker load` on the
-  packed image tars, validates, starts the stack with `--wait`, and watches dockerd.
-  SIGTERM becomes `docker compose down`.
+  has none, starts `containerd`, then `dockerd` (`overlay2`, else `vfs`), runs
+  `docker load` on the packed image tars, validates, starts the stack with `--wait`,
+  and watches dockerd. SIGTERM becomes `docker compose down`.
 - `service/compose_spec.py` is the slot/port cross-check. It reads
   `docker compose config --format json`.
 - `service/health.py` is the `GET /health` slot. It reports the phase of the launch
@@ -230,7 +230,7 @@ value is at most 32 KiB (`src/utils/guest_env.py` in nodo).
 | `COMPOSE_PROJECT_NAME` | `stack` | Prefix of each container, network and volume. Must match compose's rule `[a-z0-9][a-z0-9_-]*`. |
 | `COMPOSE_UP_TIMEOUT_S` | `600` | Time limit for `docker compose up --wait`. On a cold instance this is mostly image pulls. |
 | `COMPOSE_DOWN_TIMEOUT_S` | `30` | Container grace time for `docker compose down`. |
-| `DOCKERD_TIMEOUT_S` | `60` | Time limit for dockerd to start. It is separate from the compose limit, so the log tells "the runtime did not start" from "the stack did not start". |
+| `DOCKERD_TIMEOUT_S` | `60` | Time limit for containerd to start, then the same limit for dockerd. It is separate from the compose limit, so the log tells "the runtime did not start" from "the stack did not start". |
 | `DOCKERD_STORAGE_DRIVER` | `auto` | `auto` \| `overlay2` \| `vfs`. `auto` tries overlay2, then vfs, and logs which. |
 | `DOCKERD_DATA_ROOT` | `/var/lib/docker` | Where images and layers go. **Must be on the rootfs**, see below. |
 | `DNS_SERVERS` | `1.1.1.1 8.8.8.8` | Up to three IP addresses for `/etc/resolv.conf`. See [The network](#the-network-it-asks-for). |
@@ -388,6 +388,13 @@ What they cover:
   the supervisor now set `PATH`.
 - **Image pulls could not resolve a registry under nodo.** The guest has no
   resolver. The supervisor now writes one (`DNS_SERVERS`).
+- **dockerd never started on a node that emulates arm64.** dockerd waits a fixed 15 s
+  for the containerd that it starts itself (moby
+  `daemon/internal/containerd/server/supervisor/remote_daemon.go`, `startupTimeout`).
+  Under QEMU TCG, containerd needs more time to load its plugins, so dockerd exited
+  with `timeout waiting for containerd to start` for overlay2 and for vfs. The
+  supervisor now starts containerd, waits for its socket for `DOCKERD_TIMEOUT_S`, and
+  gives the socket to dockerd with `--containerd`. Found by the first `nodo execute`.
 - **The reap loop took exit statuses from the health thread.** `waitpid(-1)` in the
   supervisor could take the status of a `docker compose ps` child. tini is now PID 1
   and does the reaping.

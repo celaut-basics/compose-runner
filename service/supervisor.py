@@ -27,8 +27,10 @@ No shell is used *by* this module: every subprocess takes an argv list, so nothi
 operator writes in a compose file or an env var can become a command.
 """
 
+import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -40,6 +42,7 @@ from config import (
     BPF_SYSCTL,
     CGROUP_ROOT,
     COMPOSE_PLUGIN,
+    CONTAINERD_BIN,
     Config,
     ConfigError,
     DOCKER_BIN,
@@ -61,6 +64,20 @@ POLL_INTERVAL_S = 0.25
 
 # How often the supervisor re-checks that the stack is still there, once up.
 SUPERVISE_INTERVAL_S = 15
+
+# containerd. This process starts it, not dockerd. The paths are the ones that
+# dockerd gives to the containerd that it starts itself.
+CONTAINERD_STATE_DIR = "/run/docker/containerd"
+CONTAINERD_SOCKET = CONTAINERD_STATE_DIR + "/containerd.sock"
+# The plugins that dockerd disables in the containerd that it starts itself (moby
+# daemon/internal/containerd/server/supervisor/remote_daemon_options.go,
+# WithCRIDisabled). dockerd does not use CRI.
+CONTAINERD_DISABLED_PLUGINS = (
+    "io.containerd.grpc.v1.cri",
+    "io.containerd.cri.v1.images",
+    "io.containerd.cri.v1.runtime",
+    "io.containerd.podsandbox.controller.v1.podsandbox",
+)
 
 
 def log(message: str) -> None:
@@ -106,6 +123,22 @@ def _run(
     return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
+def _stop_process(process: Optional[subprocess.Popen], name: str) -> None:
+    """SIGTERM, then SIGKILL after 15 s. Nothing if the process is gone already."""
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        log(f"{name} did not exit on SIGTERM; killing it")
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log(f"{name} is unresponsive to SIGKILL; continuing")
+
+
 class Supervisor:
     """The whole lifecycle, as an object so each step is separately testable.
 
@@ -117,6 +150,7 @@ class Supervisor:
     def __init__(self, config: Config):
         self.config = config
         self.dockerd: Optional[subprocess.Popen] = None
+        self.containerd: Optional[subprocess.Popen] = None
         self.health_server = None
         self.storage_driver_used: str = ""
         self.stopping = False
@@ -308,6 +342,10 @@ class Supervisor:
             self.config.data_root,
             "--storage-driver",
             storage_driver,
+            # The containerd that start_containerd started. See that method for why
+            # dockerd does not start its own.
+            "--containerd",
+            CONTAINERD_SOCKET,
             # No API on TCP, ever. The socket is local to this VM and the stack is
             # reached through its published ports; a dockerd listening on a port would
             # be root on this instance for anyone who reached it.
@@ -367,6 +405,12 @@ class Supervisor:
         env = self.dockerd_env()
         last_error = ""
         for driver in drivers:
+            # A new containerd for each attempt, so a failed attempt leaves no state
+            # behind for the next one.
+            ok, detail = self.start_containerd(env)
+            if not ok:
+                self.stop_dockerd()
+                raise StackError(f"containerd did not become usable: {detail}")
             argv = self.dockerd_argv(driver)
             log(f"starting dockerd (storage-driver={driver}): {' '.join(argv)}")
             # stdout/stderr inherited on purpose: dockerd's own log is the most
@@ -421,20 +465,85 @@ class Supervisor:
         return False, f"{last} (waited {self.config.dockerd_timeout_s}s)"
 
     def stop_dockerd(self) -> None:
-        if self.dockerd is None:
-            return
-        if self.dockerd.poll() is None:
-            self.dockerd.terminate()
-            try:
-                self.dockerd.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                log("dockerd did not exit on SIGTERM; killing it")
-                self.dockerd.kill()
-                try:
-                    self.dockerd.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    log("dockerd is unresponsive to SIGKILL; continuing")
+        """Stop dockerd, then the containerd under it."""
+        _stop_process(self.dockerd, "dockerd")
         self.dockerd = None
+        _stop_process(self.containerd, "containerd")
+        self.containerd = None
+
+    # ------------------------------------------------------------------- containerd
+    def containerd_config(self) -> str:
+        """The containerd configuration, as TOML.
+
+        The values are the ones that dockerd writes for the containerd that it starts
+        itself: the root under the data-root, the state and the socket under
+        /run/docker/containerd, and no CRI plugins. json.dumps quotes the strings,
+        because a TOML basic string uses the same escapes.
+        """
+        root = os.path.join(self.config.data_root, "containerd", "daemon")
+        state = os.path.join(CONTAINERD_STATE_DIR, "daemon")
+        disabled = ", ".join(json.dumps(name) for name in CONTAINERD_DISABLED_PLUGINS)
+        return (
+            "version = 3\n"
+            f"root = {json.dumps(root)}\n"
+            f"state = {json.dumps(state)}\n"
+            f"disabled_plugins = [{disabled}]\n"
+            "\n"
+            "[grpc]\n"
+            f"  address = {json.dumps(CONTAINERD_SOCKET)}\n"
+        )
+
+    def start_containerd(self, env: Dict[str, str]) -> Tuple[bool, str]:
+        """Start containerd and wait until its socket accepts a connection.
+
+        dockerd can start containerd itself, but then it waits for it for a fixed
+        15 s (moby daemon/internal/containerd/server/supervisor/remote_daemon.go,
+        startupTimeout) and exits after that. On a node that runs a linux/arm64
+        guest under emulation (QEMU TCG), containerd needs more than 15 s to load its
+        plugins. So dockerd always exited with "timeout waiting for containerd to
+        start", and DOCKERD_TIMEOUT_S could not change it. This process starts
+        containerd, waits for it for DOCKERD_TIMEOUT_S, and gives its socket to
+        dockerd with --containerd.
+        """
+        os.makedirs(CONTAINERD_STATE_DIR, mode=0o711, exist_ok=True)
+        config_path = os.path.join(CONTAINERD_STATE_DIR, "containerd.toml")
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(self.containerd_config())
+        try:
+            os.unlink(CONTAINERD_SOCKET)
+        except FileNotFoundError:
+            pass
+        argv = [CONTAINERD_BIN, "--config", config_path]
+        log(f"starting containerd: {' '.join(argv)}")
+        try:
+            self.containerd = subprocess.Popen(argv, env=env)
+        except OSError as e:
+            return False, f"cannot execute containerd at {CONTAINERD_BIN}: {e}"
+        ok, detail = self.wait_for_containerd()
+        if ok:
+            log(f"containerd is up on {CONTAINERD_SOCKET}")
+        return ok, detail
+
+    def wait_for_containerd(self, socket_path: str = CONTAINERD_SOCKET) -> Tuple[bool, str]:
+        """Block until the containerd socket accepts a connection, or time out.
+
+        containerd opens its socket after it loads its plugins, so a connection that
+        is accepted means that it serves. dockerd then checks it again itself.
+        """
+        deadline = time.monotonic() + self.config.dockerd_timeout_s
+        while time.monotonic() < deadline:
+            if self.containerd is not None and self.containerd.poll() is not None:
+                return False, f"containerd exited with status {self.containerd.returncode}"
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(socket_path)
+                return True, ""
+            except OSError:
+                pass
+            finally:
+                probe.close()
+            time.sleep(POLL_INTERVAL_S)
+        return False, f"{socket_path} accepted no connection (waited {self.config.dockerd_timeout_s}s)"
 
     # ------------------------------------------------------------------ offline load
     def load_offline_images(self) -> int:
@@ -706,6 +815,12 @@ class Supervisor:
                 log(
                     f"FATAL: dockerd exited with status {self.dockerd.returncode} while "
                     "the stack was running"
+                )
+                return 1
+            if self.containerd is not None and self.containerd.poll() is not None:
+                log(
+                    f"FATAL: containerd exited with status {self.containerd.returncode} "
+                    "while the stack was running"
                 )
                 return 1
             # Sliced sleep so a signal is acted on promptly rather than up to a whole

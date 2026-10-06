@@ -123,6 +123,59 @@ class DockerdArgv(unittest.TestCase):
         # would keep them past the supervisor that owns them.
         self.assertIn("--live-restore=false", self.supervisor.dockerd_argv("overlay2"))
 
+    def test_dockerd_uses_the_containerd_that_the_supervisor_started(self):
+        argv = self.supervisor.dockerd_argv("overlay2")
+        self.assertEqual(supervisor.CONTAINERD_SOCKET, argv[argv.index("--containerd") + 1])
+
+
+class Containerd(unittest.TestCase):
+    """containerd, started by the supervisor so that dockerd's fixed 15 s does not apply."""
+
+    def test_the_config_matches_what_dockerd_writes(self):
+        text = Supervisor(make_config(data_root="/data/docker")).containerd_config()
+        self.assertIn("version = 3\n", text)
+        self.assertIn('root = "/data/docker/containerd/daemon"\n', text)
+        self.assertIn('state = "/run/docker/containerd/daemon"\n', text)
+        self.assertIn(f'address = "{supervisor.CONTAINERD_SOCKET}"\n', text)
+        for plugin in supervisor.CONTAINERD_DISABLED_PLUGINS:
+            self.assertIn(f'"{plugin}"', text)
+
+    def test_the_wait_ends_when_the_socket_accepts_a_connection(self):
+        import socket
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "c.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(path)
+            server.listen(1)
+            try:
+                sup = Supervisor(make_config(dockerd_timeout_s=5))
+                sup.containerd = FakeProcess()
+                self.assertEqual((True, ""), sup.wait_for_containerd(path))
+            finally:
+                server.close()
+
+    def test_a_containerd_that_exits_is_reported_at_once(self):
+        sup = Supervisor(make_config(dockerd_timeout_s=60))
+        sup.containerd = FakeProcess(returncode=1)
+        ok, detail = sup.wait_for_containerd("/nonexistent/c.sock")
+        self.assertFalse(ok)
+        self.assertIn("status 1", detail)
+
+    def test_a_socket_that_never_answers_times_out(self):
+        sup = Supervisor(make_config(dockerd_timeout_s=5))
+        sup.containerd = FakeProcess()
+        original = supervisor.time.monotonic
+        ticks = iter([0.0, 0.0, 10.0])
+        supervisor.time.monotonic = lambda: next(ticks)
+        try:
+            ok, detail = sup.wait_for_containerd("/nonexistent/c.sock")
+        finally:
+            supervisor.time.monotonic = original
+        self.assertFalse(ok)
+        self.assertIn("waited 5s", detail)
+
 
 class ComposeEnvironment(unittest.TestCase):
     def setUp(self):
@@ -201,6 +254,13 @@ class StorageDriverFallback(unittest.TestCase):
             return (self.attempts[-1] == succeed_on), "overlay2 not supported"
 
         self.supervisor.wait_for_docker = fake_wait
+        self.containerd_starts = 0
+
+        def fake_start_containerd(env):
+            self.containerd_starts += 1
+            return True, ""
+
+        self.supervisor.start_containerd = fake_start_containerd
         # The directories are the one part of the start path that needs privileges on a
         # real filesystem, and this test is about which driver is tried second.
         self.supervisor.prepare_directories = lambda: None
@@ -244,6 +304,19 @@ class StorageDriverFallback(unittest.TestCase):
         with self.assertRaises(StackError):
             self.supervisor.start_dockerd()
         self.assertEqual(["overlay2"], self.attempts)
+
+    def test_each_attempt_gets_a_new_containerd(self):
+        self._patch(succeed_on="vfs")
+        self.supervisor.start_dockerd()
+        self.assertEqual(2, self.containerd_starts)
+
+    def test_a_containerd_that_does_not_start_stops_the_launch(self):
+        self._patch(succeed_on="overlay2")
+        self.supervisor.start_containerd = lambda env: (False, "containerd exited with status 1")
+        with self.assertRaises(StackError) as caught:
+            self.supervisor.start_dockerd()
+        self.assertIn("containerd", str(caught.exception))
+        self.assertEqual([], self.attempts)
 
     def test_dockerd_gets_the_raw_table_switch_when_the_kernel_has_no_raw_table(self):
         self._patch(succeed_on="vfs")
@@ -596,6 +669,15 @@ class TearDown(unittest.TestCase):
         sup.dockerd = FakeProcess(returncode=0)
         sup.stop_dockerd()
         self.assertIsNone(sup.dockerd)
+
+    def test_stop_dockerd_also_stops_containerd(self):
+        sup = Supervisor(make_config())
+        sup.dockerd = FakeProcess()
+        containerd = FakeProcess()
+        sup.containerd = containerd
+        sup.stop_dockerd()
+        self.assertTrue(containerd.terminated)
+        self.assertIsNone(sup.containerd)
 
 
 class OfflineImages(unittest.TestCase):
