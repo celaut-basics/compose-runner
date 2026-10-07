@@ -1,0 +1,57 @@
+{
+    "tag": "compose-runner",
+    "architecture": "linux/arm64",
+    "init": {
+        "entry_path": [
+            "service",
+            "entrypoint.sh"
+        ]
+    },
+    "api": [
+        {
+            "port": 8080,
+            "transport": "tcp",
+            "protocol": [
+                "http"
+            ]
+        },
+        {
+            "port": 9000,
+            "transport": "tcp",
+            "protocol": [
+                "http"
+            ]
+        }
+    ],
+    "envs": [
+        "COMPOSE_PROJECT_NAME",
+        "COMPOSE_FILE",
+        "COMPOSE_UP_TIMEOUT_S",
+        "COMPOSE_DOWN_TIMEOUT_S",
+        "DOCKERD_TIMEOUT_S",
+        "DOCKERD_STORAGE_DRIVER",
+        "DOCKERD_DATA_ROOT",
+        "HEALTH_PORT",
+        "IPTABLES_BACKEND",
+        "DNS_SERVERS",
+        "DOCKER_INSECURE_NO_IPTABLES_RAW"
+    ],
+    "network": [
+        {
+            "tags": [
+                "*"
+            ],
+            "prose": "Open egress. This service pulls container images, and the hosts it pulls from cannot be listed in advance: a registry redirects layer blobs to a CDN (Docker Hub to production.cloudflare.docker.com, ghcr.io to pkg-containers.githubusercontent.com), and the compose file that names the registries is written after this template is packed. A hostname tag would not work either. nodo resolves the tag on the node and opens only the resulting addresses; it serves no DNS and opens no port 53 (src/virtualizers/microvm/network.py). dockerd must look up registry names itself, so it needs a public resolver, which the '*' grant makes reachable (DNS_SERVERS, default 1.1.1.1 and 8.8.8.8). Nothing in this image opens a socket of its own except dockerd fetching what the compose file names, and the containers of the stack. An operator who wants no egress packs the images as tars into stack/images/; they are loaded before compose runs, and the stack then needs no registry. An operator who wants the boundary enforced at the node uses service_networks in config.yaml (docs/NETWORKS.md)."
+        }
+    ],
+    "resources": {
+        "at_init": {
+            "mem_limit": 1000000000,
+            "disk_space": 4000000000
+        },
+        "at_most": {
+            "mem_limit": 4000000000,
+            "disk_space": 4000000000
+        }
+    }
+}

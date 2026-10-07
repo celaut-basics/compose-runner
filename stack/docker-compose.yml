@@ -1,0 +1,74 @@
+# The example stack, which exists to be replaced.
+#
+# This file is the one thing an operator of `compose-runner` is expected to swap out:
+# drop your own `docker-compose.yml` here, put its build contexts beside it, adjust the
+# `api` slots in `.service/service.json` to match whatever you publish, and `nodo pack .`
+# The packed service's id then identifies *that* stack -- which is the whole point of the
+# template shape. Two operators who pack two different compose files get two different
+# services, because the compose file is part of the content that is hashed.
+#
+# What is here is deliberately the smallest thing that is still a real multi-container
+# stack rather than a single container in a trench coat:
+#
+#   whoami   an HTTP server that echoes the request it received. Published, so the
+#            image test can curl it from outside the container the way a caller would
+#            reach an API slot.
+#   redis    NOT published. It exists to prove the part that is easy to get wrong: the
+#            internal compose network works, container-name DNS resolves inside it, and
+#            a service the stack needs is reachable to its siblings without being
+#            exposed to the outside. A stack that was only `whoami` would pass an image
+#            test that proved nothing about compose at all.
+#
+# Both images are pinned by digest, no tags floating, for the same reason everything in
+# `.service/Dockerfile` is: the service id is a content hash, and `redis:7-alpine`
+# resolving to something new next month would mean the same packed service id running
+# different software. A digest here is what makes the stack part of the content rather
+# than a pointer to it.
+#
+# `version:` is deliberately absent. It has been obsolete since Compose v2 and current
+# Compose warns about it on every invocation -- a warning on stderr at every startup is
+# noise in the one log an operator has.
+
+services:
+  # The published service. `ports:` here is what makes 8080 reachable from outside the
+  # microVM, and 8080 is therefore what `.service/service.json` declares as an API slot.
+  # `service/compose_spec.py` cross-checks those two lists at startup and refuses to
+  # continue if they disagree, because the failure otherwise is a slot the node
+  # advertises and forwards to nothing.
+  whoami:
+    image: traefik/whoami@sha256:200689790a0a0ea48ca45992e0450bc26ccab5307375b41c84dfc4f2475937ab
+    # Long form rather than "8080:80", because the long form is what
+    # `docker compose config --format json` normalises everything into anyway, and
+    # writing it here means the file an operator reads and the JSON the validator reads
+    # are the same shape.
+    ports:
+      - target: 80
+        published: "8080"
+        protocol: tcp
+        mode: host
+    command:
+      - --port
+      - "80"
+    # `depends_on` so compose starts redis first and `docker compose ps` has something
+    # to be interesting about. It is not a health gate -- whoami does not talk to redis
+    # -- it is here because a stack with an ordering constraint is the ordinary case and
+    # this file should look like one.
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # The unpublished dependency. No `ports:`, so nothing outside the microVM can reach
+  # it; `whoami` and anything else in this stack reach it at `redis:6379` over the
+  # default compose network.
+  redis:
+    image: redis@sha256:3b73847e72874be07e6657b129a94761662b79bc0f679273757d4218573b2a98
+    # `--save ""` turns off RDB snapshotting. This stack keeps no state worth persisting
+    # and a Celaut instance has no persistent volume for its own data, so the snapshots
+    # would be writes into the instance's disk that nothing ever reads back.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    restart: unless-stopped
