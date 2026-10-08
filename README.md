@@ -56,8 +56,10 @@ The parts:
 BuildKit secrets, swarm or overlay networks, and per-container CPU limits (the guest
 kernel cannot enforce them, see [finding 1](NODE-REQUIREMENTS.md)).
 
-**The guest kernel has two more gaps** ([finding 8](NODE-REQUIREMENTS.md)), found by
-resolving its configuration for both architectures:
+**Older nodo guest kernels have two more gaps** ([finding 8](NODE-REQUIREMENTS.md)).
+nodo fixed both in the guest kernel that celaut-project/nodo#509 pins (2026-10-07). On
+a node with that kernel, the two workarounds below do not start. They stay for older
+nodes:
 
 - No iptables `raw` table, on arm64 and x86_64. dockerd 28+ needs it for each
   container. The supervisor detects this and starts dockerd with
@@ -66,8 +68,7 @@ resolving its configuration for both architectures:
   not privileged. The entrypoint detects this and mounts cgroup v1 in place of v2, so
   runc uses the v1 devices controller. v1 has no memory controller in this kernel, so
   the memory limits of the stack's containers are not enforced (the microVM limit
-  is). Until the nodo guest kernel has `CONFIG_BPF_SYSCALL`, that is the cost of
-  amd64.
+  is).
 
 ## Use it with your own stack
 
@@ -94,8 +95,9 @@ You need a nodo with a packer backend (see `docs/skill/SKILL.md` and
    Edit `<arch>/.service/service.json` (both, if you pack both):
    - Make `api` list each port that callers must reach. Each one must be published by
      the compose file. Keep the health slot (9000).
-   - On an x86_64 node, the containers of the stack get no memory limit (cgroup v1
-     with no memory controller, [finding 8](NODE-REQUIREMENTS.md)).
+   - On an x86_64 node with a guest kernel older than celaut-project/nodo#509, the
+     containers of the stack get no memory limit (cgroup v1 with no memory
+     controller, [finding 8](NODE-REQUIREMENTS.md)).
    - Add to `envs` each variable of your stack that you want to set at launch. nodo
      does not enforce this list: `nodo execute -e` gives any variable. The list tells
      the reader of `service.json` which names the service reads.

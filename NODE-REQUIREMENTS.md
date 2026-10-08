@@ -463,6 +463,14 @@ mounted v1 for `devices cpu cpuacct pids freezer blkio net_cls perf_event hugetl
 `memory`, no `cpuset`), and brought the example stack up (two unprivileged containers,
 images pulled from Docker Hub) in 98 s.
 
+**Fixed in nodo** (2026-10-07): the guest kernel config now sets `CONFIG_BPF_SYSCALL`,
+`CONFIG_CGROUP_BPF` and `CONFIG_IP_NF_RAW` (celaut-project/nodo#504, closed), and
+celaut-project/nodo#509 pins the rebuilt guest. Real node run on nodo `dev` `7dc267a2`
+(x86_64 with KVM, 2026-10-08), released `v1` (`a87faa4a…`): the entrypoint kept cgroup v2,
+the supervisor logged no `raw` warning, the stack was up in 114.5 s, `/health` gave 200
+with 2 of 2 containers, `:8080/` gave 200 from whoami, and port 6379 refused the
+connection. The workarounds of a and b stay for nodes with an older guest kernel.
+
 ## Also re-checked: how an instance stops
 
 `nodo kill` sends SIGKILL to the hypervisor process (`src/virtualizers/microvm/kill.py`)
