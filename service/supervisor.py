@@ -48,7 +48,6 @@ from config import (
     DOCKER_BIN,
     DOCKERD_BIN,
     IPTABLES_BIN,
-    NO_IPTABLES_RAW_ENV,
     RESOLV_CONF,
     RUNTIME_PATH,
     SERVICE_JSON,
@@ -258,72 +257,42 @@ class Supervisor:
         )
         return code == 0
 
-    def dockerd_env(self) -> Dict[str, str]:
-        """The environment of dockerd: the compose environment, plus one variable.
-
-        dockerd 28.0 and later writes a DROP rule in the iptables `raw` table for each
-        container endpoint on a bridge network (moby
-        daemon/libnetwork/drivers/bridge/internal/iptabler/endpoint.go,
-        `filterDirectAccess`). The nodo guest kernel has no `CONFIG_IP_NF_RAW`, so
-        that rule fails, and each container of the stack fails to start.
-
-        When the `raw` table cannot be read, this sets
-        DOCKER_INSECURE_NO_IPTABLES_RAW=1, which is moby's own switch for a kernel
-        with no `raw` table. dockerd then writes no `raw` rule. The cost: a host on
-        the same link as the guest can send packets to a container address directly.
-        In a nodo guest that link is the node's bridge, and the node firewall blocks
-        traffic between instances. NODE-REQUIREMENTS.md, finding 8.
-
-        A value that the operator set is kept.
-        """
-        env = self.compose_env()
-        if env.get(NO_IPTABLES_RAW_ENV):
-            log(f"{NO_IPTABLES_RAW_ENV}={env[NO_IPTABLES_RAW_ENV]} was set at launch; kept")
-            return env
-        if not self.iptables_raw_available():
-            env[NO_IPTABLES_RAW_ENV] = "1"
-            log(
-                "WARNING: the iptables raw table is not available (the kernel has no "
-                f"CONFIG_IP_NF_RAW). dockerd starts with {NO_IPTABLES_RAW_ENV}=1, so "
-                "it does not block direct access to container addresses. See "
-                "NODE-REQUIREMENTS.md, finding 8."
-            )
-        return env
-
     def check_guest_kernel(
         self, bpf_sysctl: str = BPF_SYSCTL, cgroup_root: str = CGROUP_ROOT
-    ) -> List[str]:
-        """Log the kernel gaps that stop containers before dockerd hides them.
+    ) -> None:
+        """Stop with a clear message on a guest kernel that cannot run the stack.
 
-        On cgroup v2, runc applies the device rules of a container with an eBPF
-        program. With no bpf(2) in the kernel (no CONFIG_BPF_SYSCALL), runc refuses
-        each container that has a deny rule, which is each container that is not
-        `privileged: true` (opencontainers/cgroups devices/v2.go, `setV2` and
-        `canSkipEBPFError`). The nodo x86_64 guest kernel has no CONFIG_BPF_SYSCALL.
-        The arm64 guest kernel has it. NODE-REQUIREMENTS.md, finding 8.
+        This service supports only the nodo guest kernel that celaut-project/nodo#509
+        pins (nodo `dev` 2b419a0a, 2026-10-07, and later). That kernel has the two
+        things below. An older guest kernel lacks them, and the containers of the
+        stack then fail one by one with errors from runc or dockerd. This check
+        names the cause before dockerd starts. NODE-REQUIREMENTS.md, finding 8.
 
-        entrypoint.sh (step 3b) replaces cgroup v2 with v1 on such a kernel, so this
-        warning shows only when that did not work.
+        - bpf(2) (CONFIG_BPF_SYSCALL). On cgroup v2, runc applies the device rules of
+          a container with an eBPF program, and refuses each container that is not
+          privileged when it cannot (opencontainers/cgroups devices/v2.go, `setV2`).
+          The sysctl exists only when the kernel has bpf(2).
+        - The iptables `raw` table (CONFIG_IP_NF_RAW). dockerd 28.0 and later writes
+          a DROP rule in it for each container endpoint on a bridge network (moby
+          `filterDirectAccess`).
 
-        Not fatal: a stack of privileged containers still starts, and the check
-        reads a proxy for the kernel option, not the option itself. The warning is
-        there so the runc error that follows has a cause next to it.
-
-        Returns the warnings, for the tests.
+        Raises StackError with each gap that it finds.
         """
-        warnings: List[str] = []
+        gaps: List[str] = []
         cgroup_v2 = os.path.exists(os.path.join(cgroup_root, "cgroup.controllers"))
         if cgroup_v2 and not os.path.exists(bpf_sysctl):
-            warnings.append(
-                "WARNING: cgroup v2 is mounted and the kernel has no bpf(2) "
-                f"({bpf_sysctl} is missing, so CONFIG_BPF_SYSCALL is off). runc "
-                "cannot apply device rules, so each container that is not "
-                "privileged will fail to start. This is a gap of the guest kernel. "
-                "See NODE-REQUIREMENTS.md, finding 8."
+            gaps.append(f"no bpf(2) ({bpf_sysctl} is missing)")
+        if not self.iptables_raw_available():
+            gaps.append(f"no iptables raw table ({IPTABLES_BIN} -t raw -S fails)")
+        if gaps:
+            raise StackError(
+                "the guest kernel is too old for this service: "
+                + "; ".join(gaps)
+                + ". Use a nodo with the guest kernel of celaut-project/nodo#509 "
+                "(nodo dev 2b419a0a or later, with the pinned guest assets "
+                "installed). See NODE-REQUIREMENTS.md, finding 8."
             )
-        for warning in warnings:
-            log(warning)
-        return warnings
+        log("guest kernel: bpf(2) and the iptables raw table are available")
 
     # ---------------------------------------------------------------------- dockerd
     def dockerd_argv(self, storage_driver: str) -> List[str]:
@@ -405,7 +374,7 @@ class Supervisor:
         else:
             drivers = (self.config.storage_driver,)
 
-        env = self.dockerd_env()
+        env = self.compose_env()
         last_error = ""
         for driver in drivers:
             # A new containerd for each attempt, so a failed attempt leaves no state
