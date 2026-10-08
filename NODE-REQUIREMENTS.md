@@ -41,9 +41,10 @@ depends on the compiler.
 
 **KVM, and a guest kernel built from this checkout's fragment.** Nothing else — no
 device node, no module, no native application. The kernel features are all present
-except the ones in findings 1 and 8. On an **x86_64** node, finding 8 would stop each
-container that is not privileged; the entrypoint works around it with cgroup v1, with
-no memory limits for the containers (finding 8 b).
+except the one in finding 1. Finding 8 is fixed in the guest kernel that
+celaut-project/nodo#509 pins. **Minimum nodo:** `dev` at `2b419a0a` (2026-10-07) or
+later, with the pinned guest assets installed. On an older guest kernel the service
+stops at start with a clear message (finding 8).
 
 **Not a GPU.** `celaut.Sysresources` has `mem_limit`, `disk_space`, `cpu_period`,
 `cpu_quota` and `blkio_weight` and no accelerator field, so a stack needing one could
@@ -421,13 +422,11 @@ no `raw` table, each container of the stack fails to start. The only switch is t
 environment variable `DOCKER_INSECURE_NO_IPTABLES_RAW=1`
 (`iptabler/port.go`, `rawRulesDisabled`).
 
-**What this service does about it:** the supervisor reads the `raw` table with the
-selected `iptables` (`iptables -t raw -S`). If that fails, it starts dockerd with
-`DOCKER_INSECURE_NO_IPTABLES_RAW=1` and logs a warning. A value set at launch is kept.
-The cost: dockerd does not block packets that a host on the same link sends straight to
-a container address. In a nodo guest that link is the node's bridge, and the node
-firewall blocks traffic between instances (`src/virtualizers/microvm/network.py`,
-`configure_guest_firewall_policy`, default deny).
+**What this service does about it** (since 2026-10-08): the supervisor reads the `raw`
+table with the selected `iptables` (`iptables -t raw -S`). If that fails, it stops
+before dockerd starts, with a message that names the minimum nodo. Release `v1` started
+dockerd with `DOCKER_INSECURE_NO_IPTABLES_RAW=1` in this case. That workaround was
+removed by maintainer decision (2026-10-08).
 
 **b. No `bpf(2)` on x86_64 (`CONFIG_BPF_SYSCALL`, and so no `CONFIG_CGROUP_BPF`).**
 The x86_64 `defconfig` of linux 6.12.103 sets no BPF option, and the fragment asks for
@@ -439,16 +438,13 @@ loaded, runc refuses the container unless every rule allows everything
 container has deny rules. So on an x86_64 node, each container that is not
 `privileged: true` fails to start.
 
-**What this service does** (since 2026-10-06): `service/entrypoint.sh` step 3b. When
-cgroup v2 is mounted and `/proc/sys/kernel/unprivileged_bpf_disabled` is missing (that
-sysctl exists only with `CONFIG_BPF_SYSCALL`), it unmounts cgroup v2 and mounts one
-cgroup v1 hierarchy for each controller that the kernel can mount on v1. The v1
-devices controller needs no eBPF, so runc applies the device rules there. The guest has
-no `CONFIG_MEMCG_V1`, so v1 has no memory controller: the memory limits of the stack's
-containers are not enforced, and the entrypoint logs a warning. The microVM keeps its
-own memory limit. If the devices controller cannot be mounted on v1, the entrypoint
-mounts cgroup v2 again and logs a warning. The supervisor still logs its warning if
-cgroup v2 stays mounted with no bpf(2).
+**What this service does** (since 2026-10-08): when cgroup v2 is mounted and
+`/proc/sys/kernel/unprivileged_bpf_disabled` is missing (that sysctl exists only with
+`CONFIG_BPF_SYSCALL`), the supervisor stops before dockerd starts, with a message that
+names the minimum nodo. From 2026-10-06 to 2026-10-08 (release `v1`),
+`service/entrypoint.sh` step 3b mounted cgroup v1 in place of v2 on such a kernel, with
+no memory limits for the containers. That workaround was removed by maintainer decision
+(2026-10-08).
 
 **What nodo could do about it:** add `CONFIG_BPF_SYSCALL=y`, `CONFIG_CGROUP_BPF=y` and
 `CONFIG_IP_NF_RAW=y` to `bash/guest-kernel/nodo-guest.config`, in the block that says
@@ -469,7 +465,8 @@ celaut-project/nodo#509 pins the rebuilt guest. Real node run on nodo `dev` `7dc
 (x86_64 with KVM, 2026-10-08), released `v1` (`a87faa4a…`): the entrypoint kept cgroup v2,
 the supervisor logged no `raw` warning, the stack was up in 114.5 s, `/health` gave 200
 with 2 of 2 containers, `:8080/` gave 200 from whoami, and port 6379 refused the
-connection. The workarounds of a and b stay for nodes with an older guest kernel.
+connection. The workarounds of a and b were then removed (maintainer decision,
+2026-10-08): this service supports only the guest kernel of #509 and later.
 
 ## Also re-checked: how an instance stops
 

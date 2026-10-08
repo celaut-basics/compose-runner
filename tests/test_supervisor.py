@@ -248,7 +248,6 @@ class StorageDriverFallback(unittest.TestCase):
             return FakeProcess()
 
         self.envs = []
-        self.supervisor.iptables_raw_available = lambda: True
 
         def fake_wait():
             return (self.attempts[-1] == succeed_on), "overlay2 not supported"
@@ -318,13 +317,14 @@ class StorageDriverFallback(unittest.TestCase):
         self.assertIn("containerd", str(caught.exception))
         self.assertEqual([], self.attempts)
 
-    def test_dockerd_gets_the_raw_table_switch_when_the_kernel_has_no_raw_table(self):
-        self._patch(succeed_on="vfs")
-        self.supervisor.iptables_raw_available = lambda: False
+    def test_dockerd_gets_no_raw_table_switch(self):
+        # Only the current guest kernel is supported: it has the raw table, so dockerd
+        # starts with no DOCKER_INSECURE_NO_IPTABLES_RAW from this service.
+        os.environ.pop("DOCKER_INSECURE_NO_IPTABLES_RAW", None)
+        self._patch(succeed_on="overlay2")
         self.supervisor.start_dockerd()
-        self.assertEqual(2, len(self.envs))
         for env in self.envs:
-            self.assertEqual("1", env[config.NO_IPTABLES_RAW_ENV])
+            self.assertNotIn("DOCKER_INSECURE_NO_IPTABLES_RAW", env)
 
 
 class GuestKernel(unittest.TestCase):
@@ -338,7 +338,6 @@ class GuestKernel(unittest.TestCase):
         self.saved_environ = dict(os.environ)
         self.saved_run = supervisor._run
         self.calls = []
-        os.environ.pop(config.NO_IPTABLES_RAW_ENV, None)
 
     def tearDown(self):
         self.directory.cleanup()
@@ -369,52 +368,51 @@ class GuestKernel(unittest.TestCase):
         self.assertTrue(self.supervisor.iptables_raw_available())
         self.assertEqual([[config.IPTABLES_BIN, "-t", "raw", "-S"]], self.calls)
 
-    def test_a_readable_raw_table_adds_nothing(self):
+    def test_the_current_kernel_passes(self):
         self._fake_run(0)
-        self.assertNotIn(config.NO_IPTABLES_RAW_ENV, self.supervisor.dockerd_env())
-
-    def test_no_raw_table_sets_the_switch(self):
-        self._fake_run(3)
-        self.assertEqual("1", self.supervisor.dockerd_env()[config.NO_IPTABLES_RAW_ENV])
-
-    def test_a_value_set_at_launch_is_kept_and_not_probed(self):
-        self._fake_run(3)
-        os.environ[config.NO_IPTABLES_RAW_ENV] = "0"
-        self.assertEqual("0", self.supervisor.dockerd_env()[config.NO_IPTABLES_RAW_ENV])
-        self.assertEqual([], self.calls)
-
-    def test_the_switch_is_not_in_the_environment_of_compose(self):
-        # It is for dockerd only. compose and the stack do not read it.
-        self._fake_run(3)
-        self.supervisor.dockerd_env()
-        self.assertNotIn(config.NO_IPTABLES_RAW_ENV, self.supervisor.compose_env())
-
-    def test_cgroup_v2_with_no_bpf_gives_a_warning(self):
-        self._touch("cgroup", "cgroup.controllers")
-        warnings = self.supervisor.check_guest_kernel(
-            bpf_sysctl=self._path("no-such-sysctl"), cgroup_root=self._path("cgroup")
-        )
-        self.assertEqual(1, len(warnings))
-        self.assertIn("bpf", warnings[0])
-
-    def test_cgroup_v2_with_bpf_gives_no_warning(self):
         self._touch("cgroup", "cgroup.controllers")
         sysctl = self._touch("unprivileged_bpf_disabled")
-        self.assertEqual(
-            [],
-            self.supervisor.check_guest_kernel(
-                bpf_sysctl=sysctl, cgroup_root=self._path("cgroup")
-            ),
-        )
+        self.supervisor.check_guest_kernel(bpf_sysctl=sysctl, cgroup_root=self._path("cgroup"))
 
-    def test_cgroup_v1_gives_no_bpf_warning(self):
-        # runc uses the v1 devices controller there, not eBPF.
-        os.makedirs(self._path("cgroup", "memory"))
-        self.assertEqual(
-            [],
+    def test_cgroup_v2_with_no_bpf_stops_the_start(self):
+        self._fake_run(0)
+        self._touch("cgroup", "cgroup.controllers")
+        with self.assertRaises(StackError) as caught:
             self.supervisor.check_guest_kernel(
                 bpf_sysctl=self._path("no-such-sysctl"), cgroup_root=self._path("cgroup")
-            ),
+            )
+        message = str(caught.exception)
+        self.assertIn("no bpf(2)", message)
+        self.assertNotIn("raw table", message)
+        self.assertIn("celaut-project/nodo#509", message)
+
+    def test_no_raw_table_stops_the_start(self):
+        self._fake_run(3)
+        self._touch("cgroup", "cgroup.controllers")
+        sysctl = self._touch("unprivileged_bpf_disabled")
+        with self.assertRaises(StackError) as caught:
+            self.supervisor.check_guest_kernel(bpf_sysctl=sysctl, cgroup_root=self._path("cgroup"))
+        message = str(caught.exception)
+        self.assertIn("no iptables raw table", message)
+        self.assertNotIn("bpf", message)
+        self.assertIn("celaut-project/nodo#509", message)
+
+    def test_both_gaps_are_named(self):
+        self._fake_run(3)
+        self._touch("cgroup", "cgroup.controllers")
+        with self.assertRaises(StackError) as caught:
+            self.supervisor.check_guest_kernel(
+                bpf_sysctl=self._path("no-such-sysctl"), cgroup_root=self._path("cgroup")
+            )
+        self.assertIn("no bpf(2)", str(caught.exception))
+        self.assertIn("no iptables raw table", str(caught.exception))
+
+    def test_cgroup_v1_needs_no_bpf(self):
+        # runc uses the v1 devices controller there, not eBPF (a Docker host, not nodo).
+        self._fake_run(0)
+        os.makedirs(self._path("cgroup", "memory"))
+        self.supervisor.check_guest_kernel(
+            bpf_sysctl=self._path("no-such-sysctl"), cgroup_root=self._path("cgroup")
         )
 
 

@@ -92,50 +92,6 @@ else
     fi
 fi
 
-# ------------------------------------------- 3b. no bpf(2): cgroup v1 for the devices
-# On cgroup v2, runc applies the device rules of each container with an eBPF program.
-# A kernel with no bpf(2) (no CONFIG_BPF_SYSCALL; the nodo x86_64 guest kernel) makes
-# runc refuse each container that is not privileged (NODE-REQUIREMENTS.md, finding 8).
-# The sysctl below exists only when the kernel has bpf(2).
-#
-# The v1 devices controller needs no eBPF. So, on such a kernel, this replaces the v2
-# mount with v1 hierarchies, one for each controller that the kernel can mount on v1.
-# dockerd and runc then use cgroup v1. The memory controller is usually missing on v1
-# (no CONFIG_MEMCG_V1), so memory limits of the stack's containers are not enforced.
-# The microVM keeps its own memory limit. If the devices controller cannot be mounted,
-# the v2 mount comes back and nothing changes.
-cgroup_v1_for_devices() {
-    umount /sys/fs/cgroup 2>/dev/null || { log "WARNING: cannot unmount cgroup2 at /sys/fs/cgroup; containers that are not privileged will fail to start"; return 0; }
-    mount -t tmpfs -o mode=0755,nosuid,nodev,noexec cgroup /sys/fs/cgroup || fatal "cannot mount a tmpfs at /sys/fs/cgroup"
-    mounted=""
-    for controller in devices cpu cpuacct cpuset pids freezer blkio memory net_cls perf_event hugetlb; do
-        mkdir -p "/sys/fs/cgroup/$controller"
-        if mount -t cgroup -o "$controller" cgroup "/sys/fs/cgroup/$controller" 2>/dev/null; then
-            mounted="$mounted $controller"
-        else
-            rmdir "/sys/fs/cgroup/$controller"
-        fi
-    done
-    case " $mounted " in
-        *" devices "*)
-            log "the kernel has no bpf(2): cgroup v1 is mounted for:$mounted"
-            case " $mounted " in
-                *" memory "*) ;;
-                *) log "WARNING: no memory controller on cgroup v1: the memory limits of the stack's containers are not enforced (the microVM limit still is)" ;;
-            esac
-            ;;
-        *)
-            for controller in $mounted; do umount "/sys/fs/cgroup/$controller"; rmdir "/sys/fs/cgroup/$controller"; done
-            umount /sys/fs/cgroup
-            mount -t cgroup2 none /sys/fs/cgroup || fatal "cannot mount cgroup2 at /sys/fs/cgroup again"
-            log "WARNING: the kernel has no bpf(2) and no v1 devices controller; containers that are not privileged will fail to start"
-            ;;
-    esac
-}
-if [ -f /sys/fs/cgroup/cgroup.controllers ] && [ ! -e /proc/sys/kernel/unprivileged_bpf_disabled ]; then
-    cgroup_v1_for_devices
-fi
-
 # ------------------------------------------------------------- 4. iptables, explicitly
 # The one runtime decision this shell makes rather than checks.
 #

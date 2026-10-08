@@ -241,19 +241,12 @@ class EntryPath(unittest.TestCase):
         self.assertIn("/opt/docker/bin", config.RUNTIME_PATH.split(":"))
         self.assertEqual("/usr/local/sbin", config.RUNTIME_PATH.split(":")[0])
 
-    def test_the_entrypoint_moves_to_cgroup_v1_only_with_no_bpf(self):
-        # NODE-REQUIREMENTS.md finding 8 b: no bpf(2) means no device rules on cgroup v2.
-        # The switch must key on the same sysctl as the supervisor's warning, keep v2
-        # when bpf(2) exists, and put v2 back if the v1 devices controller is missing.
+    def test_the_entrypoint_does_not_move_to_cgroup_v1(self):
+        # Only the current guest kernel is supported (it has bpf(2)), so the old
+        # workaround of finding 8 b (cgroup v1 for the devices controller) is gone.
         text = _read(os.path.join(ROOT, "service", "entrypoint.sh"))
-        self.assertIn(config.BPF_SYSCTL, text)
-        self.assertRegex(
-            text,
-            r'(?m)^if \[ -f /sys/fs/cgroup/cgroup\.controllers \] && \[ ! -e '
-            + re.escape(config.BPF_SYSCTL) + r' \]; then\n    cgroup_v1_for_devices\nfi$',
-        )
-        self.assertIn('*" devices "*)', text)
-        self.assertIn("mount -t cgroup2 none /sys/fs/cgroup ||", text)
+        self.assertNotIn("cgroup_v1_for_devices", text)
+        self.assertNotIn(config.BPF_SYSCTL, text)
 
     def test_the_supervisor_runs_under_tini(self):
         text = _read(os.path.join(ROOT, "service", "entrypoint.sh"))
