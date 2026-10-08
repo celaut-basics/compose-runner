@@ -56,19 +56,20 @@ The parts:
 BuildKit secrets, swarm or overlay networks, and per-container CPU limits (the guest
 kernel cannot enforce them, see [finding 1](NODE-REQUIREMENTS.md)).
 
-**Older nodo guest kernels have two more gaps** ([finding 8](NODE-REQUIREMENTS.md)).
-nodo fixed both in the guest kernel that celaut-project/nodo#509 pins (2026-10-07). On
-a node with that kernel, the two workarounds below do not start. They stay for older
-nodes:
+## Minimum nodo
 
-- No iptables `raw` table, on arm64 and x86_64. dockerd 28+ needs it for each
-  container. The supervisor detects this and starts dockerd with
-  `DOCKER_INSECURE_NO_IPTABLES_RAW=1`.
-- No `bpf(2)` on **x86_64**. On cgroup v2, runc then refuses each container that is
-  not privileged. The entrypoint detects this and mounts cgroup v1 in place of v2, so
-  runc uses the v1 devices controller. v1 has no memory controller in this kernel, so
-  the memory limits of the stack's containers are not enforced (the microVM limit
-  is).
+This service needs the nodo guest kernel that celaut-project/nodo#509 pins: nodo
+`dev` at `2b419a0a` (2026-10-07) or later, with the pinned guest assets installed.
+That kernel has `bpf(2)` and the iptables `raw` table on x86_64 and arm64
+([finding 8](NODE-REQUIREMENTS.md)). dockerd 28+ needs the `raw` table for each
+container, and runc on cgroup v2 needs `bpf(2)` for each container that is not
+privileged.
+
+On an older guest kernel the service stops at start, before dockerd, with a message
+that names the missing feature and this minimum. Release `v1` had workarounds for the
+older kernels (cgroup v1 in place of v2, and `DOCKER_INSECURE_NO_IPTABLES_RAW=1`).
+They were removed by maintainer decision (2026-10-08): only the current guest kernel
+is supported.
 
 ## Use it with your own stack
 
@@ -95,9 +96,6 @@ You need a nodo with a packer backend (see `docs/skill/SKILL.md` and
    Edit `<arch>/.service/service.json` (both, if you pack both):
    - Make `api` list each port that callers must reach. Each one must be published by
      the compose file. Keep the health slot (9000).
-   - On an x86_64 node with a guest kernel older than celaut-project/nodo#509, the
-     containers of the stack get no memory limit (cgroup v1 with no memory
-     controller, [finding 8](NODE-REQUIREMENTS.md)).
    - Add to `envs` each variable of your stack that you want to set at launch. nodo
      does not enforce this list: `nodo execute -e` gives any variable. The list tells
      the reader of `service.json` which names the service reads.
@@ -265,7 +263,6 @@ value is at most 32 KiB (`src/utils/guest_env.py` in nodo).
 | `DNS_SERVERS` | `1.1.1.1 8.8.8.8` | Up to three IP addresses for `/etc/resolv.conf`. See [The network](#the-network-it-asks-for). |
 | `HEALTH_PORT` | `9000` | The health slot. Must match the slot in `service.json`. |
 | `IPTABLES_BACKEND` | `legacy` | `legacy` \| `nft`. Read by the entrypoint. [Finding 1](NODE-REQUIREMENTS.md) explains the default. |
-| `DOCKER_INSECURE_NO_IPTABLES_RAW` | set to `1` only if the kernel has no iptables `raw` table | Read by dockerd. The supervisor sets it when `iptables -t raw -S` fails, and keeps a value that you give. [Finding 8](NODE-REQUIREMENTS.md). |
 
 A value that is not valid stops the service at start, with the reason. For example,
 `COMPOSE_UP_TIMEOUT_S=abc` is refused. It does not become 600.
@@ -388,7 +385,7 @@ What they cover:
   2 s cache.
 - **The supervisor** (`test_supervisor.py`), with each subprocess replaced: the
   overlay2 to vfs fallback, argv always a list, `DOCKER_HOST` and `PATH` not
-  inherited, the `raw` table switch and the `bpf(2)` warning, the resolver file, the health phases, a packed tar that fails to load is
+  inherited, the guest-kernel check (`bpf(2)` and the `raw` table) that stops the start, the resolver file, the health phases, a packed tar that fails to load is
   fatal, and SIGTERM becomes `compose down`.
 - **The build-time reader** (`test_preflight.py`). A construct that it cannot parse
   gives a note, and a note turns a failure into a warning. A partial parser must not
