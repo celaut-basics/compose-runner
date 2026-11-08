@@ -71,6 +71,12 @@ older kernels (cgroup v1 in place of v2, and `DOCKER_INSECURE_NO_IPTABLES_RAW=1`
 They were removed by maintainer decision (2026-10-08): only the current guest kernel
 is supported.
 
+Tested with nodo `dev` a97148dd (2026-11-08): release
+[`v3`](https://github.com/celaut-basics/compose-runner/releases/tag/v3), `eea5b8.celaut.bee`
+(linux/amd64, service id `eea5b8e072751c29a19b34ca5248a0d8c1ece04bfc4d0aa6ca0299eae47db538`).
+The asset was imported on a node with a clean registry, and the sample stack ran:
+`/health` gave 200 with 2 of 2 containers running, and whoami answered on 8080.
+
 ## Use it with your own stack
 
 You need a nodo with a packer backend (see `docs/skill/SKILL.md` and
@@ -96,9 +102,10 @@ You need a nodo with a packer backend (see `docs/skill/SKILL.md` and
    Edit `<arch>/.service/service.json` (both, if you pack both):
    - Make `api` list each port that callers must reach. Each one must be published by
      the compose file. Keep the health slot (9000).
-   - Add to `envs` each variable of your stack that you want to set at launch. nodo
-     does not enforce this list: `nodo execute -e` gives any variable. The list tells
-     the reader of `service.json` which names the service reads.
+   - Add to `envs` each variable of your stack that you want to set at launch. The
+     packer writes the names into the spec (nodo#582): `nodo service_envs <id>` lists
+     them, and `nodo execute` asks for each one that `-e` does not give (nodo#574;
+     Enter leaves it unset). `nodo execute -e` still gives any variable.
    - Raise `resources.at_init.disk_space` if your images are large. See
      [Resources](#resources).
 
